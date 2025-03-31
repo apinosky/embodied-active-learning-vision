@@ -1,0 +1,274 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import numpy as np
+import torch
+np.set_printoptions(precision=3)
+import yaml
+from termcolor import cprint, colored
+import shutil
+
+import rospy
+import multiprocessing as mp
+from argparse import Namespace
+from faster_fifo import Queue as FastQueue
+import time
+
+########## local imports ##########
+import sys, os
+from control.klerg_utils import *
+
+from plotting.plotter import plotter
+from dist_modules.utils import set_env, get_env_info, build_arg_dicts, SimpleQueueWrapper
+from dist_modules.fingerprint_module import FingerprintDist
+from dist_modules.trainer_ddp import train, train_async
+from dist_modules.test_fingerprint_main import test_fingerprint, test_main, FingerprintBufferTorch
+from dist_modules.utils import add_yaml_representers
+
+add_yaml_representers()
+
+if __name__== '__main__':
+
+    ########## load ros params ##########
+    num_steps = rospy.get_param('num_steps', 10)
+    save_name = rospy.get_param('save_name', 'test')
+    orig_fingerprint_names = rospy.get_param('fingerprint_names', 'block')
+    fingerprint_method = rospy.get_param('fingerprint_method', 'grid')
+    fingerprint_path = rospy.get_param("fingerprint_path", "eval/")
+    model_path = rospy.get_param("model_path", "model_final.pth")
+    new_model_explr = rospy.get_param("new_model_explr", False)
+    explr_fingerprint_model = rospy.get_param("explr_fingerprint_model", None)
+    explr_states = rospy.get_param("explr_states", 'xyzw') # x y w
+    test_path = rospy.get_param('test_path', 'data/intensity/entklerg_0000/')
+    test_config_file = rospy.get_param("test_config_file", "fp_trainer_config.yaml")
+    update_rate = rospy.get_param("belief_plotting_rate", 100)
+    use_async = rospy.get_param("async", True)
+
+    assert len(model_path.split(' '))==len(fingerprint_path.split(' ')),'number of models and fingerprint paths must match'
+    num_models = len(model_path.split(' '))
+    assert not(isinstance(explr_fingerprint_model,int) and new_model_explr),'cannot specify new model exploration saved and fingerprint exploration'
+
+    if ';' in orig_fingerprint_names:
+        fingerprint_names = [x.split(' ') for x in orig_fingerprint_names.split(';')]
+    else: 
+        fingerprint_names = [orig_fingerprint_names.split(' ')]*num_models
+    ########## load test config ##########
+    base_path = rospy.get_param('base_path', './')
+    full_test_path = base_path + '/' + test_path + '/'
+
+    args = Namespace()
+    with open(full_test_path + "/config.yaml","r") as f:
+        params = yaml.load(f, Loader=yaml.FullLoader)
+    for k, v in params.items():
+        setattr(args, k, v)
+
+    # override with new steps / save path
+    args.dir_path = full_test_path
+    args.num_steps = num_steps
+    full_img_dim = args.image_dim.copy()
+
+    # build save path
+    fpaths = []
+    for idx,fp_path in enumerate(fingerprint_path.split(' ')):
+        fpath = full_test_path + fp_path+save_name.split('/')[0]
+        if os.path.exists(fpath) == False:
+            os.makedirs(fpath)
+        elif idx == 0: 
+            check_path = input(colored('this path already exists, are you sure you want to proceed?  Y/N (N will quit)\n','red'))
+            if ('n' in check_path.lower()):
+                cprint('got N ... aborting ...','red')
+                raise Exception('aborting')
+
+        fpaths.append(full_test_path + fp_path+save_name)
+
+    num_trainers = 0
+    if new_model_explr:
+        # load exploration / training config
+        src_file = base_path+'/config/' + test_config_file
+        with open(src_file) as f:
+            tmp = yaml.load(f,Loader=yaml.FullLoader)
+        # save for future reference
+        for fp_path in fpaths:
+            shutil.copy(src_file, fp_path+'_'+test_config_file)  # dst can be a folder; use shutil.copy2() to preserve timestamp
+
+        for _, param in tmp.items(): # top level is for user readability
+            for k, v in param.items():
+                setattr(args, k, v)
+        if use_async:
+            if torch.cuda.is_available() and args.use_gpu:
+                args.device = 'cuda:0'
+                cprint('Using GPU','green')
+                if torch.cuda.device_count() < args.num_update_proc:
+                    cprint(f'Requested more update processes than available cuda devices, so changing from {args.num_update_proc} to {torch.cuda.device_count()}','red')
+                    args.num_update_proc = torch.cuda.device_count()
+            else:
+                args.device = 'cpu'
+                args.use_gpu = False
+
+            num_trainers = args.num_update_proc
+            if num_trainers == 1: 
+                args.ddp_trainer = False
+                args.ddp_model = False
+        else:
+            # only use single thread (not distributed) for model exploration
+            args.ddp_trainer = False
+            args.ddp_model = False
+            args.num_update_proc = 1
+        # args.explr_method = 'entklerg'
+
+        def update_dim(image_dim,down_sample):
+            image_dim[1:] = image_dim[1:]//down_sample #+1
+
+        args.image_dim = np.array(args.image_dim)
+        update_dim(args.image_dim,args.extra_down_sample)
+        args.image_dim = args.image_dim.tolist()
+        explr_dim = args.s_dim
+        use_z = True
+
+        main_dir_path = full_test_path + '/../test_explr_tmp_'+save_name.split('/')[0] + '/' # just saving the first place
+        if os.path.exists(main_dir_path) == False:
+            os.makedirs(main_dir_path)
+        with open(main_dir_path + "config.yaml","w") as f:
+            yaml.dump(args.__dict__,f)
+
+    else:
+        args.num_target_samples = num_steps
+        use_z = False
+
+    args.dtype = eval(args.dtype)
+    args.image_dim = np.array(args.image_dim)
+    args.tray_lim = np.array(args.tray_lim)
+    args.tray_ctrl_lim = np.array(args.tray_ctrl_lim)
+    args.robot_lim = np.array(args.robot_lim)
+    args.robot_ctrl_lim = np.array(args.robot_ctrl_lim)
+
+    # set up shared plotting buffers
+    from plotting.plotting_buffer import PlottingBufferTorch
+    plotter_queue_explr = SimpleQueueWrapper(FastQueue(1000*1000))
+    corners = 4
+    args.y_dim = np.flip(args.image_dim)
+    plotter_buffer =  PlottingBufferTorch(capacity=100,x_dim=args.s_dim,y_dim=args.y_dim,z_dim=args.z_dim,num_target_samples=args.num_target_samples+corners,explr_dim=explr_dim,use_z=use_z,horizon=args.horizon,dtype=args.dtype)
+    plotter_buffer.share_memory()
+
+    fingerprint_buffer =  FingerprintBufferTorch(capacity=num_steps,x_dim=args.s_dim,y_dim=full_img_dim,dtype=args.dtype,device=args.device)
+    fingerprint_buffer.share_memory()
+
+    if new_model_explr:
+        from vae.vae_buffer import ReplayBufferTorch
+        replay_buffer = ReplayBufferTorch(capacity=num_steps,x_dim=args.s_dim,y_dim=args.image_dim,device=args.device,dtype=args.dtype,learn_force=args.learn_force,world_size=num_trainers,batch_size=args.batch_size)
+        replay_buffer.share_memory()
+        # change path
+        main_args = Namespace(**vars(args))
+        main_args.dir_path = main_dir_path 
+
+        model_dict,trainer_args = build_arg_dicts(main_args,replay_buffer)
+    else:
+        replay_buffer = None
+        main_args = args
+
+    ########## cleanup any processes left from previous runs ##########
+    os.system("kill -9 $(ps aux | grep multiprocessing.spawn | grep -v grep | awk '{print $2}') ")
+    ########## specify number of processes and process-specific params ##########
+    mp.set_start_method('spawn')
+
+    if args.pybullet: 
+        num_cores_extra=1
+    else:
+        num_cores_extra=2
+
+    # num_models *= 2 # if using error
+    processes = []
+    if num_trainers > 0:
+        world_size = num_models + num_trainers 
+        env_args = {'ccl_worker_count':0} if args.num_update_proc == 1 else {}
+        env_info = get_env_info(world_size,num_extra_processes=1+1,async_main=True,start_offset=0,num_cores_extra=num_cores_extra,**env_args)
+    else:
+        world_size = num_models + 1 + num_trainers
+        os.environ['OMP_NUM_THREADS'] = '20'
+        env_info = get_env_info(world_size,num_extra_processes=1,start_offset=0,num_cores_extra=num_cores_extra,ccl_worker_count=0)
+    seed = args.seed
+    if isinstance(explr_fingerprint_model,int):
+        # out_tdist_queue,in_tdist_queue  = mp.Pipe()
+        tdist_queue = SimpleQueueWrapper(FastQueue(1000*1000))
+        cprint('[TEST] got fingerprint idx','cyan')
+    else:
+        # out_tdist_queue,in_tdist_queue  = None,None
+        tdist_queue = None
+    if new_model_explr and use_async:
+        ########## set up update processes ##########
+        data_queues = []
+        for rank in range(1, num_trainers):
+            set_env(rank,world_size,env_info)
+            data_out,data_in = mp.Pipe()
+            data_queues.append(data_in)
+            p = mp.Process(target=train, args=(rank,num_trainers,trainer_args,args.seed,data_out))
+            p.start()
+            processes.append(p)
+        ########## set up main async train ##########
+        rank = 0 # for ddp main trainer must be 0
+        set_env(rank,world_size,env_info)
+        p = mp.Process(target=train_async, args=(rank,num_trainers,trainer_args,args.seed,[None],data_queues,args.ddp_trainer))
+        p.start()
+        processes.append(p)
+    ########## set up test processes ##########
+    plotter_queue_train = []
+    rank = num_trainers-1
+    for idx,(test_model_path,test_fp_path) in enumerate(zip(model_path.split(' '),fingerprint_path.split(' '))):
+        for error in [False]: # [True,False]:
+            for dist_method in ['L2']: #,'KL']:
+                # plotter_out,in_queues = np.array([mp.Pipe() for _ in range(num_models)]).T
+                # plotter_queue_train.append(in_queues)
+                plotter_out = SimpleQueueWrapper(FastQueue(1000*1000))
+                plotter_queue_train.append(plotter_out)
+                test_config = {'target_dist': FingerprintDist,
+                'fingerprint_names': fingerprint_names[idx],
+                'fingerprint_method':fingerprint_method,
+                'num_steps':num_steps,
+                'model_path': test_model_path,
+                'fingerprint_path': test_fp_path,
+                'save_name': save_name,
+                'explr_states': explr_states,
+                'test_path': full_test_path,
+                'error': error,
+                'dist_method': dist_method,
+                'render_figs': args.render_figs
+                }
+                rank+=1
+                set_env(rank,world_size,env_info)
+                p = mp.Process(target=test_fingerprint, args=(rank,world_size,seed,plotter_out,fingerprint_buffer,test_config,tdist_queue,update_rate,num_steps))
+                p.start()
+                processes.append(p)
+    ########## set up main process ##########
+    rank=world_size
+    set_env(rank,world_size,env_info)
+    p_main = mp.Process(target=test_main, args=(rank,world_size,seed,plotter_queue_train,fingerprint_buffer,tdist_queue,plotter_queue_explr,plotter_buffer,explr_states,update_rate,main_args,replay_buffer,fpaths,env_info['max_cores_per_proc']))
+    p_main.start()
+    processes.append(p_main)
+    
+    ########## set up plotting process ##########
+    rank=world_size-1
+    set_env(rank,world_size,env_info)
+    # args.render_figs = True
+    p = mp.Process(target=plotter, args=(rank,world_size,args.seed,plotter_queue_explr,args.states,plotter_buffer,args.render_figs,args.save_figs))
+    p.start()
+    processes.append(p)
+
+    ########## cluster objects ##########
+    p_main.join() # wait for main process to end before clustering
+    if new_model_explr:
+        time.sleep(10)
+        from dist_modules.fingerprint_builder import collect_centers
+        collect_centers(dir_path=main_args.dir_path,model_path='model_postexplr.pth',buffer=replay_buffer)
+
+    ########## join all other processes ##########
+    for p in processes:
+        try:
+            p.join()
+        except:
+            pass
+
+    ########## end? w/ extra cleanup check ##########
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+    os.system("kill -9 $(ps aux | grep multiprocessing.spawn | grep -v grep | awk '{print $2}') ")

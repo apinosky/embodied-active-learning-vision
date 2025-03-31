@@ -1,0 +1,110 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+import rospy
+
+########## local imports ##########
+import sys, os
+from control.klerg_utils import *
+from dist_modules.sensor_test_module import SensorTest
+from geometry_msgs.msg import Pose, PoseStamped, Quaternion
+from scipy.spatial.transform import Rotation
+
+render=True
+
+if __name__== '__main__':
+
+    test = SensorTest(None,num_steps=None,init_vel=False,explr_states='xyzrpw')
+    test.zoom = 1
+    make_square = rospy.get_param("square", False)
+
+    cmd = Pose()
+    cmd.position.x =  0.44 # 75 #-0.04 #0.06
+    cmd.position.y =  -0.0+0.035 # 0.025
+    cmd.position.z =  0.65
+    # quat = np.array([0.3,0.7,0.,0.])
+    quat = np.array([0.7,0.3,0.,0.])
+    quat /= np.linalg.norm(quat)
+    cmd.orientation = Quaternion(*quat)
+    pos = np.array(test.process_pose_msg(cmd)[0])
+
+    done = False
+    while not rospy.is_shutdown() and not(done):
+        if test.got_state and test.got_img and not(test.pause):
+            try:
+                pos_msg = test.send_cmd(cmd,-1)
+                success = pos_msg.success
+                if not pos_msg.success:
+                    rospy.logwarn('pausing -- send resume message when motion error is resolved')
+                    test.reset_pub.publish()
+                    test.pause = True
+            except rospy.ServiceException as e:
+                rospy.logwarn(f'pausing -- resolve the following ServiceException before resuming\nrospy.service.ServiceException:{e}')
+                test.pause = True
+                success = False
+            if success:
+                data,test_pos,full_pos,force,success = test.get_latest_msg(make_square=make_square)
+                if success:
+                    # check if it's at the test location
+                    if np.all(np.abs(pos-test_pos) < 0.01):
+                        done = True
+            test.rate.sleep()
+
+    # plot
+    data,test_pos,full_pos,force,success = test.get_latest_msg(make_square=make_square)
+    fig,ax = plt.subplots(1,1,figsize=(5,5))
+    ax.xaxis.set_ticklabels([])
+    ax.xaxis.set_ticks([])
+    ax.yaxis.set_ticklabels([])
+    ax.yaxis.set_ticks([])
+    ax.set_aspect('equal', adjustable='box')
+    # rotate image to match workspace (real overhead quat = [0.3 0.7 0 0] but that's far from "reset" pose)
+    data = np.rot90(data,k=-1,axes=(0,1))
+    plot = ax.imshow(data)
+    fig.tight_layout()
+    if render:
+        plt.show(block=False)
+
+    done = False
+    while not done: 
+        out = input("Do you want to retake the picture? Press 'r' to retake picture or any other key to continue\n")
+        if out.lower() == 'r': 
+            data,test_pos,full_pos,force,success = test.get_latest_msg(make_square=make_square)
+            data = np.rot90(data,k=-1,axes=(0,1))
+            plot.set_data(data)
+            fig.canvas.draw_idle()
+            fig.canvas.flush_events()
+        else: 
+            done = True
+
+    save_img = input('Do you want to save the workspace image? Y/N (N will exit without saving) ')
+    if not('n' in save_img.lower()):
+        save_name = rospy.get_param("save_name", "eval/")
+        print(test.dir_path+'/'+save_name+'workspace.svg')
+        fig.savefig(test.dir_path+'/'+save_name+'workspace.svg')
+
+    lower_arm = 'n' # input('Do you want to lower arm (z)? Y/N (N will exit without resetting arm) ')
+    if not('n' in lower_arm.lower()):
+        # lower
+        iter_step = 0.
+        while not rospy.is_shutdown() and iter_step < 6:
+            if test.got_state and test.got_img and not(test.pause):
+                try:
+                    pos_msg = test.send_cmd(cmd,-1)
+                    success = pos_msg.success
+                    if not pos_msg.success:
+                        rospy.logwarn('pausing -- send resume message when motion error is resolved')
+                        test.reset_pub.publish()
+                        test.pause = True
+                except rospy.ServiceException as e:
+                    rospy.logwarn(f'pausing -- resolve the following ServiceException before resuming\nrospy.service.ServiceException:{e}')
+                    test.pause = True
+                    success = False
+            if success:
+                iter_step += 1
+                cmd.position.z -=  0.05
+            test.rate.sleep()

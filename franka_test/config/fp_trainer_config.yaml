@@ -1,0 +1,26 @@
+---
+general:
+  # seed: 1
+  save_figs: True
+  render_figs: True
+  num_update_proc: 1
+  explr_method: entklerg # randomWalk
+model:
+  extra_down_sample: 4
+  batch_size: 64
+trainer:
+  model_lr: 0.001
+  update_rate: 1
+  frames_before_update: 1
+  num_learning_opt: 5 # 50
+  hyperparam_ramp:
+    beta_manual_ramp: True
+    beta_warmup_steps: 200 # total number of beta updates
+    beta_warmup_epoch: 2 # number of updates before beta can be updated
+    beta_start_weight: 0.
+    beta_end_weight: 0.1
+    gamma_manual_ramp: True
+    gamma_warmup_steps: 1000 # total number of gamma updates
+    gamma_warmup_epoch: 10 # number of updates before gamma can be updated
+    gamma_start_weight: 0.
+    gamma_end_weight: 1.0

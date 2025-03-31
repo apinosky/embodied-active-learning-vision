@@ -1,0 +1,191 @@
+#!/usr/bin/env python
+
+import numpy as np
+import rospy
+from geometry_msgs.msg import Twist, Transform, Quaternion, Point, Pose
+from math import pi
+import tf
+from franka_test.srv import PoseCmd, PoseCmdResponse,VelCmd, GetStartState, GetStartStateResponse, UpdateVel, UpdateVelResponse, UpdateState, UpdateStateResponse, JointCmd
+from std_msgs.msg import Empty, Float32
+from franka_msgs.msg import ErrorRecoveryActionGoal
+from franka_msgs.srv import SetCartesianImpedance, SetCartesianImpedanceResponse, SetEEFrame, SetEEFrameResponse
+from controller_manager_msgs.srv import LoadController, SwitchController
+from threading import RLock
+
+print_debug = True
+
+class Move(object):
+    def __init__(self):
+        super(Move, self).__init__()
+
+        ## set impedance before starting controllers
+        self.set_impedance = rospy.ServiceProxy('/franka_control/set_cartesian_impedance',SetCartesianImpedance)
+        self.set_ee_frame = rospy.ServiceProxy('/franka_control/set_EE_frame',SetEEFrame)
+        # self.home =  [0.012480725393758803, -0.29768355590877604, -0.009472851066853595, -2.0784466000166155, -0.006375518157533217, 1.792500004072647, 0.3851315747952818]
+        self.home =  [0.012480725393758803, -0.29768355590877604, -0.009472851066853595, -2.0784466000166155, -0.006375518157533217, 1.792500004072647, -0.7737304602066702]
+        # ee_impedance = [2000, 2000, 2000, 100, 100, 100] # stiff
+        # ee_impedance = [200, 200, 200, 10, 10, 10] # compliant
+        # success = self.set_impedance(ee_impedance) # state limits are [10,3000], angle limits are [1,300]
+        # if not success.success:
+        #     print('got error when setting impedance',success.error)
+
+        ## set up controllers and start position controller
+        self.controller_mode = None
+        self.controllers = {
+                            'pose':{'name':'cartesian_pose_interface','service':'/pose_cmd','type': PoseCmd},
+                            'vel' :{'name':'cartesian_vel_interface' ,'service':'/vel_cmd','type':VelCmd},
+                            'joint':{'name':'joint_position_interface','service':'/joint_cmd','type': JointCmd},
+                            None: {'name':'cartesian_state_interface'}
+                            }
+        load_controller = rospy.ServiceProxy('/controller_manager/load_controller', LoadController)
+        for mode in self.controllers.keys():
+            success = load_controller(self.controllers[mode]['name'])
+        self.switch_controller = rospy.ServiceProxy('/controller_manager/switch_controller', SwitchController)
+        self.got_pose_msg = False
+        self.pose_msg = None
+        self.mode_lock = RLock()
+
+        # set up node and subscribers
+        rospy.init_node('Move', anonymous=False)
+        rospy.Service('/update_impedance_params',SetCartesianImpedance, self.impedanceCallback)
+        rospy.Service('/update_ee_frame',PoseCmd, self.eeCallback)
+        rospy.Subscriber('/reset',Empty, self.resetCallback)
+        rospy.Subscriber('/switch_to_pose_controller',Empty, self.switch_pose_controller_callback)
+        rospy.Subscriber('/switch_to_vel_controller',Empty, self.switch_vel_controller_callback)
+        rospy.Subscriber('/reset_joints',Empty, self.resetJointsCallback)
+
+        self.start_pose = Transform()
+        self.start_pose.translation.x = 0.475# 0.5 # 0.577663
+        self.start_pose.translation.y = 0.0 # 0.1 # 0.0917118
+        self.start_pose.translation.z = 0.4 # 0.415 # 0.370351
+        # self.start_pose.rotation = Quaternion(*tf.transformations.quaternion_from_euler(pi, 0.,-pi/8))
+        self.start_pose.rotation = Quaternion(*tf.transformations.quaternion_from_euler(pi, 0.,pi/4))
+        rospy.Subscriber('/set_new_reset_xyz',Point, self.set_new_reset_xyz)
+
+        self.brightness_pub = rospy.Publisher('/update_brightness',Float32,queue_size=1,latch=False)
+
+        self.start_controller('pose')
+        start_pose = self.cmd_service(self.start_pose)
+        rospy.logwarn(start_pose)
+
+        self.start_controller('vel')
+        rospy.Service('/klerg_start_pose',GetStartState,self.startCallback)
+        rospy.Service('/klerg_cmd',UpdateVel, self.velCallback)
+        rospy.Service('/klerg_pose',UpdateState, self.poseCallback)
+
+    def set_new_reset_xyz(self,msg): # use >100 to skip that dimension
+        if msg.x < 100:
+            self.start_pose.translation.x = msg.x
+        if msg.y < 100:
+            self.start_pose.translation.y = msg.y
+        if msg.z < 100:
+            self.start_pose.translation.z = msg.z
+        self.resetCallback(None)
+
+    def impedanceCallback(self,msg):
+        ee_impedance = msg.cartesian_stiffness
+        # unload controller
+        self.switch_controller([''],[self.controllers[self.controller_mode]['name']],1,0,0.) # Args: start_controllers stop_controllers strictness start_asap timeout
+        # set impedance
+        success = self.set_impedance(ee_impedance) # state limits are [10,3000], angle limits are [1,300]
+        # reload controllers
+        self.switch_controller([self.controllers[self.controller_mode]['name']],[''],1,0,0.) # Args: start_controllers stop_controllers strictness start_asap timeout
+        return success
+
+    def eeCallback(self,msg):
+        t = msg.pose_cmd.translation
+        q = msg.pose_cmd.rotation
+        ee_frame = np.dot(tf.transformations.quaternion_matrix([q.x,q.y,q.z,q.w]),tf.transformations.translation_matrix([t.x,t.y,t.z]))
+        # unload controller
+        self.switch_controller([''],[self.controllers[self.controller_mode]['name']],1,0,0.) # Args: start_controllers stop_controllers strictness start_asap timeout
+        # set impedance
+        success = self.set_ee_frame(ee_frame.T.flatten())
+        # reload controllers
+        self.switch_controller([self.controllers[self.controller_mode]['name']],[''],1,0,0.) # Args: start_controllers stop_controllers strictness start_asap timeout
+        return PoseCmdResponse()
+
+
+    def switch_pose_controller_callback(self,msg):
+        with self.mode_lock:
+            self.start_controller('pose')
+
+    def switch_vel_controller_callback(self,msg):
+        with self.mode_lock:
+            self.start_controller('vel')
+
+    def start_controller(self,mode):
+        if (self.controller_mode is not mode):
+            self.switch_controller([self.controllers[mode]['name']],[self.controllers[self.controller_mode]['name']],1,0,0.) # Args: start_controllers stop_controllers strictness start_asap timeout
+            rospy.wait_for_service(self.controllers[mode]['service'])
+            self.cmd_service = rospy.ServiceProxy(self.controllers[mode]['service'],self.controllers[mode]['type'])
+            self.controller_mode = mode
+            rospy.sleep(0.5)
+
+    def startCallback(self,msg):
+        desired_mode = 'vel' # msg.mode
+        with self.mode_lock:
+            self.start_controller(desired_mode)
+            start_pose = self.cmd_service(Twist())
+        rospy.logwarn('sent start pose')
+        return GetStartStateResponse(start_pose.pose,start_pose.success)
+
+    def resetCallback(self,msg):
+        with self.mode_lock:
+            current_mode = rospy.get_param('/enforce_dt',False)
+            rospy.set_param('enforce_dt',False)
+            self.start_controller('pose')
+            rospy.sleep(0.5)
+            reset_pose = self.cmd_service(self.start_pose)
+            rospy.sleep(5.)
+            self.start_controller('vel')
+            rospy.set_param('/enforce_dt',current_mode)
+
+    def resetJointsCallback(self,msg):
+        old_ctrller = self.controller_mode
+        with self.mode_lock:
+            self.start_controller('joint')
+            out = self.cmd_service(self.home)
+            rospy.sleep(5.)
+            self.start_controller(old_ctrller)
+
+
+    def velCallback(self,msg):
+        if msg.desired_brightness >= 0:
+            self.brightness_pub.publish(msg.desired_brightness)
+        with self.mode_lock:
+            self.start_controller('vel')
+            out = self.cmd_service(msg.desired_vel)
+        # if not out.success:
+        #     self.error_recovery.publish(ErrorRecoveryActionGoal())
+        return UpdateVelResponse(out.pose,out.success)
+
+    def poseCallback(self,msg):
+        if msg.desired_brightness >= 0:
+            self.brightness_pub.publish(msg.desired_brightness)
+        # error handling
+        quat_msg = msg.desired_pose.orientation
+        quat = np.array([quat_msg.x , quat_msg.y, quat_msg.z, quat_msg.w])
+        valid = np.abs(1-np.linalg.norm(quat))<0.001
+        if not valid:
+            rospy.logerr('invalid quaternion')
+            return UpdateStateResponse(Pose(),False)
+        # start with constant z and constant orientation
+        pose_goal = Transform()
+        pose_goal.translation = msg.desired_pose.position
+        pose_goal.rotation = msg.desired_pose.orientation
+
+        with self.mode_lock:
+            self.start_controller('pose')
+            out = self.cmd_service(pose_goal)
+        # if not out.success:
+        #     self.error_recovery.publish(ErrorRecoveryActionGoal())
+        return UpdateStateResponse(out.pose,out.success)
+
+
+if __name__ == '__main__':
+    # setup node
+    try:
+        franka_mover = Move()
+        rospy.spin()
+    except (rospy.ROSInterruptException,KeyboardInterrupt):
+        pass

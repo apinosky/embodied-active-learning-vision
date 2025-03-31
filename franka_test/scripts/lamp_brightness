@@ -1,0 +1,54 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import rospy
+from std_msgs.msg import Float32
+from franka_test.msg import BrightnessStamped
+import time
+import os
+from libgvmled import GVMLamp
+import numpy as np
+
+class BrightnessListener(object):
+
+    def __init__(self):
+        ### Setup Ros Env ###
+        rospy.init_node('BrightnessListener')
+        self.lamp = GVMLamp() # set_brightness [10,99] and set_cct [0,100]
+        self.lamp.turn_on()
+        self.current_brightness = 0.5 # starting
+        self.max_brightness = 99 # limits
+        self.update_brightness(self.current_brightness) # reset
+        self.brightness_pub = rospy.Publisher('/usb_cam/brightness',BrightnessStamped,queue_size=1,latch=False)
+        rospy.Timer(rospy.Duration(1/30.), self.publishBrightness) # 30 hz
+        rospy.Subscriber('/update_brightness',Float32,self.brightness_callback)
+        print("** check that wifi is connected to LED or this node doesn't work ***")
+
+    def brightness_callback(self,msg):
+        brightness = msg.data
+        # update
+        self.update_brightness(brightness)
+        # store
+        self.current_brightness = brightness
+
+    def update_brightness(self,brightness):
+        # clip
+        brightness = int(min(self.max_brightness,brightness*self.max_brightness))
+        if brightness < 10: # turn off when < 10%
+            self.lamp.turn_off()
+        elif self.current_brightness < 10: # turn back on
+            self.lamp.turn_on()
+
+        self.lamp.set_brightness(brightness)
+
+    def publishBrightness(self,event):
+        msg = BrightnessStamped()
+        msg.brightness = self.current_brightness
+        msg.header.frame_id = 'usb_cam'
+        msg.header.stamp = rospy.Time.now()
+        self.brightness_pub.publish(msg)
+
+if __name__== '__main__':
+    listener = BrightnessListener()
+    while not rospy.is_shutdown():
+        rospy.spin()

@@ -1,0 +1,175 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import numpy as np
+import matplotlib.pyplot as plt
+import pickle
+import os
+import time
+
+import rospy
+
+########## local imports ##########
+import sys, os
+from franka.franka_utils import ws_conversion
+from control.klerg_utils import *
+from dist_modules.sensor_utils import  get_grid_traj
+from dist_modules.sensor_test_module import SensorTest, ExplrDist
+from plotting.plotting_pyqtgraph import Plotter
+
+render=True
+
+if __name__== '__main__':
+
+    start_x = rospy.get_param("start_x", 0.47)
+    start_y = rospy.get_param("start_y", 0.)
+    start_z = rospy.get_param("cam_z", 0.4)
+    row_res = rospy.get_param("row_res", 5)
+    save_fingerprint = rospy.get_param("save_fingerprint", False)
+    fingerprint_name = rospy.get_param("fingerprint_name", "test")
+    save_folder = rospy.get_param("save_folder", "eval/")
+    grid_size = rospy.get_param("grid_size", 0.01)
+    num_steps = rospy.get_param("num_steps", 50)
+    test_method = rospy.get_param("test_method", 'explr') # grid
+    skip = rospy.get_param("skip", '0') # grid
+
+    # load test module
+    test = SensorTest(None,num_steps=num_steps,init_vel=False)
+    if render: 
+        fig,ax = plt.subplots(1,1)
+        fig_data = None
+        plt.ion()
+        plt.show(block=False)
+
+    # Generate test positions
+    if test_method == 'grid':
+        # Generate test positions
+        center = [start_x, start_y]
+        traj_states = {'x':0,'y':1}
+        count = 2
+        test_traj = get_grid_traj(grid_size=grid_size,num_points=row_res**2,center=center)
+        if 'w' in test.states:
+            ws = np.linspace(*test.tray_lim[test.states.rfind('w')]*0.8,row_res)
+            w_traj = []
+            num_samps = len(test_traj)
+            for idx,w in enumerate(ws):
+                traj = np.flipud(test_traj) if idx % 2 == 0 else test_traj
+                w_traj.append(np.hstack([traj,np.ones((num_samps,1))*w]))
+            test_traj = np.vstack(w_traj)
+            traj_states['w'] = count
+            count +=1
+        if 'z' in test.states:
+            zs = np.linspace(-1,1,row_res)*grid_size/2 + start_z
+            z_traj = []
+            num_samps = len(test_traj)
+            for idx,z in enumerate(zs):
+                traj = np.flipud(test_traj) if idx % 2 == 0 else test_traj
+                z_traj.append(np.hstack([traj,np.ones((num_samps,1))*z]))
+            test_traj = np.vstack(z_traj)
+            traj_states['z'] = count
+            count +=1
+        num_steps = len(test_traj)
+
+        # shuffle traj states to match explr_states order
+        explr_order = [traj_states[key] for key in test.states]
+        new_traj = test_traj.T[explr_order].T
+    elif test_method == 'explr':
+        center = np.array([start_x, start_y, start_z,np.pi,0.,0.,0.,0.,0.])
+        traj_states = {'x':0,'y':1,'z':2,'r':3,'p':4,'w':5,'X':6,'Y':7,'Z':8}
+
+        # shuffle traj states to match explr_states order
+        explr_order = [traj_states[key] for key in test.states]
+        new_center = center[explr_order]
+        target_dist = ExplrDist(explr_idx=np.arange(len(test.states)))
+        target_dist.init = True
+        test.target_dist = target_dist
+
+        print('moving to start location')
+        at_center = test.check_goal_pos(new_center,-1)
+
+        # switch mode
+        robot_center = ws_conversion(new_center, test.tray_lim, test.robot_lim)
+        vals = np.array([ np.pi if s in 'rpw'  else 0.3 for s in test.states])
+        target_dist.push(robot_center,vals)
+        test.start_explr(robot_center,explr_states=test.states)
+        test.robot.use_prior = False
+        test.robot.test(test.num_target_samples)
+        time.sleep(1)
+
+        if not test.render_figs: 
+            from pyvirtualdisplay import Display
+            display = Display(visible=0, size=(1920,1080))
+            display.start() 
+            test.render_figs=True
+
+        plot_explr = Plotter(test.plot_idx,test.xinit,path=test.dir_path,plot_zs=False,render=test.render_figs,robot_lim=test.robot_lim, tray_lim=test.tray_lim,save_folder='',tdist=True,states=test.states)
+
+    # fingerprint
+    fingerprint_state = []
+    fingerprint_data = []
+    if test.learn_force: 
+        fingerprint_force = []
+        skip*=2 # let it try for twice as long
+
+    print('starting to collect data')
+    iter_step = 0
+    # main loop
+    while not rospy.is_shutdown() and iter_step < num_steps*skip and len(fingerprint_state) < num_steps:
+        if test.got_state and test.got_img and not(test.pause):
+            if test_method == 'grid':
+                pos_des = new_traj[iter_step].copy()
+                success,out = test.step(iter_step=iter_step,pos=pos_des)
+            else:
+                success,out = test.step(iter_step)
+            if success:
+                robot_state,data,force = out
+                if test_method == 'grid':
+                    pos_check = ws_conversion(robot_state,test.robot_lim,test.tray_lim)
+                    # check if it's at the test location
+                    print(iter_step,pos_check-pos_des)
+                    log_data = np.all(np.abs(pos_check-pos_des) < 0.01)
+                else:
+                    log_data = True
+                    if test.explr_update is not None:
+                        plot_explr.update(test.explr_update)
+                if log_data:
+                    if save_fingerprint:
+                        save_step = False
+                        if (test.learn_force):
+                            if (force > 2.):
+                                save_step = True
+                                if (len(fingerprint_state) % 10 == 0):
+                                    print(f'{len(fingerprint_state)}/{num_steps}')
+                        elif iter_step % skip == 0:
+                            if ((iter_step / skip) % 10 == 0):
+                                print(f'{int(iter_step/skip)}/{num_steps}')
+                            save_step = True
+                        if save_step: 
+                            if render: 
+                                if fig_data is None: 
+                                    fig_data = ax.imshow(data)
+                                else: 
+                                    fig_data.set_data(data)
+                                    fig_data.autoscale()
+                                fig.canvas.draw_idle()
+                                fig.canvas.flush_events()
+
+                            fingerprint_state.append(robot_state)
+                            fingerprint_data.append(data)
+                            if test.learn_force: 
+                                fingerprint_force.append(force)
+                    iter_step += 1
+            test.rate.sleep()
+
+    test.stop_pub.publish()
+    if os.path.exists(test.dir_path+save_folder) == False:
+        os.makedirs(test.dir_path+save_folder)
+    if save_fingerprint:
+        fingerprint_dict = {
+            "state":np.array(fingerprint_state),
+            "data":np.array(fingerprint_data),
+        }
+        if test.learn_force: 
+            fingerprint_dict["force"] = np.array(fingerprint_force)
+        pickle.dump( fingerprint_dict, open( test.dir_path+f"{save_folder}/{fingerprint_name}.pickle", "wb" ) )
+    print('done')

@@ -1,0 +1,347 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import torch
+import torch.multiprocessing as mp
+import numpy as np
+from termcolor import cprint
+from faster_fifo import Queue as FastQueue
+import time
+import rospy
+import rosnode
+import socket
+import matplotlib.pyplot as plt
+
+########## local imports ##########
+import os
+from dist_modules.utils import set_env, get_env_info, build_arg_dicts, SimpleQueueWrapper, reset_env
+from plotting.plotter import plotter
+from load_config import get_config
+
+if __name__== '__main__':
+    args = get_config()
+    y_dim = np.flip(args.image_dim)
+    use_debug_plotter = False
+    shared_model = True
+    set_ros_affinity = True
+    use_plotters = True
+    clustering = rospy.get_param('clustering',False)
+    ########## cleanup any processes left from previous runs ##########
+    os.system("kill -9 $(ps aux | grep multiprocessing.spawn | grep -v grep | awk '{print $2}') ")
+    ########## get config ##########
+    num_train_plotters = 1
+    world_size = args.num_update_proc if args.ddp_trainer else 1
+    num_extra_processes = args.distributed*use_plotters*(num_train_plotters+1) + args.distributed*2 + args.ddp_trainer*(-1) + args.async_trainer + clustering
+    num_cores_extra = 1 
+    ########## build modules (if needed) ##########
+    if args.distributed and not args.ddp_trainer and not args.async_trainer: # plotter only
+        replay_buffer = None
+    else:
+        from vae.vae_buffer import ReplayBufferTorch
+        replay_buffer = ReplayBufferTorch(capacity=args.buffer_capacity,x_dim=args.s_dim,y_dim=args.image_dim,device=args.device,dtype=args.dtype,learn_force = args.learn_force,world_size=world_size,batch_size=args.batch_size)
+        replay_buffer.share_memory()
+    model_dict,train_args = build_arg_dicts(args,replay_buffer)
+    if args.distributed and use_plotters:
+        from plotting.plotting_buffer import PlottingBufferTorch
+        corners = 4
+        plotter_buffer = PlottingBufferTorch(capacity=500,x_dim=args.s_dim,y_dim=y_dim,z_dim=args.z_dim,num_target_samples=args.num_target_samples+corners,explr_dim=args.s_dim,horizon=args.horizon,dtype=args.dtype)
+        plotter_buffer.share_memory()
+    else: 
+        plotter_buffer = None
+
+    ########## specify number of processes and process-specific params ##########
+    if set_ros_affinity:
+        time.sleep(10) # wait for all nodes to be started
+        machine = socket.gethostname()
+        nodes = rosnode.get_nodes_by_machine(machine)
+        all_nodes = ''.join(nodes)
+        skip = ('rosout' in all_nodes) + ('republish' in all_nodes)
+        num_extra_processes += len(nodes) - skip     
+
+    processes = []
+    env_args = {'ccl_worker_count':0} if args.num_update_proc == 1 else {}
+    env_info = get_env_info(world_size,num_extra_processes=num_extra_processes,num_cores_extra=num_cores_extra,start_offset=0,print_debug=False,async_main=args.async_trainer,**env_args)
+    # print(env_info)
+    # print(os.environ['CCL_WORKER_AFFINITY'],os.environ['CCL_WORKER_COUNT'])
+    if args.distributed:
+        ########## imports ##########
+        set_env(0,world_size,env_info) # set params before import
+        if not args.async_trainer: 
+            from dist_modules.main_sync import main
+            if args.ddp_trainer: # ddp
+                from dist_modules.trainer_ddp import train
+        else: 
+            from dist_modules.main_async import main
+            from dist_modules.trainer_ddp import train, train_async
+        ########## set up update processes ##########
+        mp.set_start_method('spawn')
+        data_queues = []
+        if args.ddp_trainer:
+            for rank in range(1, world_size):
+                set_env(rank,world_size,env_info)
+                data_out,data_in = mp.Pipe()
+                data_queues.append(data_in)
+                p = mp.Process(target=train, args=(rank,world_size,train_args,args.seed,data_out))
+                p.start()
+                processes.append(p)
+        ########## set up main process ##########
+        if clustering: 
+            clustering_queue = SimpleQueueWrapper(FastQueue(1000*1000))
+        else: 
+            clustering_queue = None
+        if use_plotters: 
+            # plotter_out, plotter_in = mp.Pipe()
+            plotter_queue_explr = SimpleQueueWrapper(FastQueue(1000*1000),many=True)
+            plotter_queue_train = [SimpleQueueWrapper(FastQueue(1000))]*num_train_plotters
+        else: 
+            plotter_queue_explr = None
+            plotter_queue_train = None
+        if not args.async_trainer:
+            rank = 0
+            set_env(rank,world_size,env_info)
+            p = mp.Process(target=main, args=(rank,world_size,args,train_args,plotter_queue_explr,plotter_queue_train,data_queues,plotter_buffer))
+            p.start()
+            processes.append(p)
+            if args.ddp_trainer:
+                rank = world_size-1
+        else:
+            if shared_model:
+                # ---- shared model for between trainers and model for updating instead of writing checkpoints to files (optional)
+                ## build model
+                from vae import get_VAE
+                VAE = get_VAE(args.learn_force)
+                model = VAE(**model_dict).to(device=args.device,dtype=args.dtype)
+                model.device = args.device
+                model.dtype = args.dtype
+                model.learning_ind = torch.tensor([0])
+                model.share_memory()
+                train_args['shared_model'] = model
+                # ----
+            rank = 0 # for ddp main trainer must be 0
+            set_env(rank,world_size,env_info)
+            p = mp.Process(target=train_async, args=(rank,world_size,train_args,args.seed,plotter_queue_train,data_queues,args.ddp_trainer))
+            p.start()
+            processes.append(p)
+            rank = world_size # to choose location
+            ########## setup async main ##########
+            set_env(rank,world_size,env_info)
+            p = mp.Process(target=main, args=(rank,world_size,args,train_args,plotter_queue_explr,env_info['max_cores_per_proc'],plotter_buffer,clustering_queue))
+            p.start()
+            processes.append(p)
+        if use_plotters: 
+            ########## set up explr plotting processes ##########
+            rank += 1
+            set_env(rank,world_size,env_info)
+            p = mp.Process(target=plotter, args=(rank,world_size,args.seed,plotter_queue_explr,args.states,plotter_buffer,args.render_figs,args.save_figs))
+            p.start()
+            processes.append(p)
+            ########## set up train plotting process(es) ##########
+            for plot_count,plot_queue in enumerate(plotter_queue_train):
+                rank += 1
+                set_env(rank,world_size,env_info)
+                p = mp.Process(target=plotter, args=(rank,world_size,args.seed,plot_queue,args.states,None,args.render_figs,args.save_figs))
+                p.start()
+                processes.append(p)
+        ########## setup clustering ##########
+        if clustering: 
+            rank += 1
+            set_env(rank,world_size,env_info)
+            from dist_modules.clustering import cluster
+            if not shared_model: 
+                # ---- make model for clustering (optional), skip if already built above
+                ## build model
+                from vae import get_VAE
+                VAE = get_VAE(args.learn_force)
+                model = VAE(**model_dict).to(device=args.device,dtype=args.dtype)
+                model.device = args.device
+                model.dtype = args.dtype
+                model.share_memory() # to pass this to the process
+                train_args['shared_model'] = model
+                shared_model = True
+                # ----
+            p = mp.Process(target=cluster, args=(rank,world_size,train_args,args.seed,clustering_queue))
+            p.start()
+            processes.append(p)
+            # rank -= 1 # use same env params as this process (sensor_main) 
+        ########## setup debug plotter ##########
+        if use_debug_plotter: 
+            rank += 1
+            set_env(rank,world_size,env_info)
+            from plotting.debug_plotter import debug_plotter
+            if not shared_model: 
+                # ---- make model for debug plotter (optional), skip if already built above
+                ## build model
+                from vae import get_VAE
+                VAE = get_VAE(args.learn_force)
+                model = VAE(**model_dict).to(device=args.device,dtype=args.dtype)
+                model.device = args.device
+                model.dtype = args.dtype
+                model.share_memory() # to pass this to the process
+                shared_model = True
+                # ----
+            else:
+                model = train_args['shared_model']
+            p = mp.Process(target=debug_plotter, args=(rank,world_size,args.seed,args.dir_path,args.states,y_dim,model,args.learn_force,model,args.render_figs,args.save_figs))
+            p.start()
+            processes.append(p)
+            rank -= 1 # use same env params as this process (sensor_main) 
+        ########## join all processes ##########
+        rank += 1
+        set_env(rank,world_size,env_info,set_cpu_affinity=True)
+        if set_ros_affinity:
+            ros_affinity = {}
+            for node in nodes: 
+                if not ('rosout' in node) and not ('republish' in node):
+                    rank += 1
+                    num_cores = np.fromstring(env_info[rank]['affinity'][1:-1],sep=', ',dtype=int).tolist()
+                    ros_affinity[node] = num_cores
+            rospy.set_param('ros_affinity',ros_affinity)
+        for p in processes:
+            try:
+                p.join()
+            except:
+                pass
+        ########## end? w/ extra cleanup check ##########
+        for p in processes:
+            if p.is_alive():
+                cprint(f"[MAIN] Terminating {p}",'red')
+                p.terminate()
+        os.system("kill -9 $(ps aux | grep multiprocessing.spawn | grep -v grep | awk '{print $2}') ")
+        cprint('[MAIN] quitting','blue')
+        reset_env()
+    else: ### run everything in one process
+        killer = None
+        train_post_explr = False
+        rank = 0
+        set_env(rank,world_size,env_info,set_cpu_affinity=True)
+        if use_plotters: 
+            from plotting.plotting_pyqtgraph import Plotter, TrainingPlotter
+        from dist_modules.sensor_main_module import SensorMain
+        from dist_modules.sensor_utils import get_cost
+        from dist_modules.trainer_module import Trainer, update_loss_plots
+        import pickle
+        train_args['args'].num_learning_opt = train_args['args'].target_learning_rate
+
+        trainer = Trainer(train_args,rank,killer)
+        test = SensorMain(trainer.model,trainer.optimizer,replay_buffer,args,killer)
+        test.robot.test(test.num_target_samples)
+
+        # main loop
+        fig1 = False
+        loss_fig = None
+        plot_losses=False
+        plot_combo=True
+        done = False
+        iter_step = 0
+        explr_info = []
+        ergodic_cost = []
+        weighted = False
+        while not rospy.is_shutdown() and not done:
+            while iter_step < test.num_steps:
+                if test.got_state and test.got_img and (test.robot is not None) and not(test.pause):
+                    if not fig1 and use_plotters: # set up plotting
+                        if not args.render_figs: 
+                            from pyvirtualdisplay import Display
+                            display = Display(visible=0, size=(1920,1080))
+                            display.start() 
+                            args.render_figs=True
+                        print(test.xinit)
+                        plot_zs=True
+                        plot = Plotter(test.plot_idx,test.xinit,path=test.dir_path,plot_zs=plot_zs,states=test.states,render=args.render_figs, robot_lim=test.robot_lim, tray_lim=test.tray_lim)
+                        plot_train = TrainingPlotter(path=test.dir_path,render=args.render_figs)
+                        fig1 = True
+                    if args.print_debug: start = time.time()
+                    success,out = test.step(iter_step)
+                    if success:
+                        if iter_step > test.frames_before_training:
+                            # prep trainer
+                            trainer.pre_train_mp(iter_step)
+                            if args.print_debug: cprint('[MASTER] data sent to all trainers','cyan')
+                            step_loss = trainer(weighted)
+                            test.post_train_mp(iter_step,trainer.learning_ind)
+                            # update plots
+                            trainer.post_train_mp(iter_step,step_loss)
+                            loss_fig = update_loss_plots(plot_losses,plot_combo,trainer,loss_fig)
+                        iter_step += 1
+                    if args.print_debug: cprint('finished update | {}'.format(time.time()-start),'green')
+                    # update_figs
+                    if test.explr_update is not None:
+                        if use_plotters:
+                            data = test.explr_update
+                            data[0] = data[0].cpu().numpy() # cam_data
+                            data[1] = data[1].cpu().numpy() # state
+                            data[2] = data[2].cpu().numpy() # force
+                            data[3] = [d.cpu().numpy() for d in data[3]] # robot data
+                            if plot_zs:
+                                for idx in [4,5,6]:
+                                    data[idx] = data[idx].cpu().squeeze().numpy()
+                            plot.update(data)
+                        explr_info.append(test.explr_update)
+                        ergodic_cost.append(get_cost(test.explr_update))
+                        test.explr_update = None
+                    if use_plotters:
+                        if trainer.training_update is not None:
+                            data = trainer.training_update
+                            for idx in [0,1,2]:
+                                data[idx] = data[idx].cpu().numpy()
+                            plot_train.training_update(data)
+                            trainer.training_update = None
+                        if trainer.checkpoint_update is not None:
+                            data = trainer.checkpoint_update
+                            for idx in [0,1,2]:
+                                data[idx] = data[idx].cpu().numpy()
+                            plot_train.checkpoint_update(data)
+                            trainer.checkpoint_update = None
+                    if args.save_figs and use_plotters:
+                        if iter_step % 100 == 0: # int(test.num_steps/6) == 0:
+                            plot.save('iter{:05d}'.format(iter_step-1))
+                            if test.fname is not None:
+                                plot.save(test.fname,main_fname='iter{:05d}'.format(iter_step-1))
+                                plot_train.save(test.fname,main_fname='iter{:05d}'.format(iter_step-1))
+                                test.fname = None
+                    if iter_step % 100 == 0: # int(test.num_steps/6) == 0:
+                        test.publish_distribution = True
+                if not test.pybullet:
+                    test.rate.sleep()
+
+            test.stop_pub.publish()
+            test.save(post_explr=False)
+            if loss_fig is not None:
+                if len(loss_fig[0]) > 0:
+                    loss_fig[0][0].savefig(trainer.dir_path+f'/trainer_trends_step{trainer.learning_ind:05d}.svg')
+                # [plt.close(lf[0]) for lf in loss_fig if len(lf) > 0]
+
+
+            # post learning
+            if train_post_explr:
+                weighted = False
+                print('post exploration learning')
+                train_steps = trainer.learning_ind
+                for iter_post in range(train_steps):
+                    step_loss = trainer(weighted)
+                    trainer.post_train_mp(iter_step,step_loss,print_update=250)
+                    loss_fig = update_loss_plots(plot_losses,plot_combo,trainer,loss_fig)
+                    # update_figs
+                    if trainer.checkpoint_update is not None and use_plotters:
+                        data = trainer.checkpoint_update
+                        for idx in [0,1,2]:
+                            data[idx] = data[idx].cpu().numpy().T
+                        plot_train.checkpoint_update(data)
+                        trainer.checkpoint_update = None
+                        plot_train.save_fig3_only(f'step{trainer.learning_ind:05d}',trainer.learning_ind)
+
+            if loss_fig is not None:
+                if len(loss_fig[0]) > 0:
+                    loss_fig[0][0].savefig(trainer.dir_path+f'/trainer_trends_step{trainer.learning_ind:05d}.svg')
+
+            test.save(post_explr=True)
+            test.write_to_log('done')
+            done = True
+
+            # close figures 
+            if loss_fig is not None:
+                [plt.close(lf[0]) for lf in loss_fig if len(lf) > 0]
+
+            # save info
+            pickle.dump( explr_info, open( test.dir_path+"explr_update_info.pickle", "wb" ),protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump( ergodic_cost, open( test.dir_path+"ergodic_cost.pickle", "wb" ),protocol=pickle.HIGHEST_PROTOCOL)

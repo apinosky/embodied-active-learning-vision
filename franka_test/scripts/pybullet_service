@@ -1,0 +1,15 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import rospy
+
+########## local imports ##########
+from franka.franka_module import FrankaBridge
+
+if __name__== '__main__':
+    rospy.init_node('PybulletService')
+    try: 
+        bridge = FrankaBridge(node=True)
+        rospy.spin()
+    except rospy.ROSException: 
+        pass

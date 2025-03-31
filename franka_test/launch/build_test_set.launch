@@ -1,0 +1,83 @@
+<?xml version="1.0" ?>
+
+<launch>
+    <arg name="use_gui" default ="True" />
+    <arg name="pybullet" default ="False" />
+    <arg name="render_pybullet" default ="True" />
+    <arg name="dt" default="0.1"/>
+    <arg name="cam_z" default="0.4" doc="currently only used for pybullet"/>
+    <arg name="test_config_file" default="test_config.yaml"/>
+    <arg name="sensor_method" default="rgb"/>
+    <arg name="num_steps" default="50"/>
+
+    <arg name="save_fingerprint" default="True"/>
+    <arg name="test_path" default="/data/rgb/icra/randomWalk_0001_xyw_star-plant/" doc="path relative to franka_test directory"/>
+    <arg name="save_folder" default="../eval_xyw_duck-plant/" doc="where to save fingerprints"/>
+    <arg name="test_method" default="explr" doc="grid or explr"/>
+
+    <arg name="fingerprint_name" default="duck" doc="whatever name you want"/>
+    <arg name="loc" default="bottom_left" doc="see launch file"/>
+    <arg name="skip" default="4" doc="how often to save images"/>
+
+    <!-- params -->
+    <param name="base_path" value="$(find franka_test)" type="string" />
+    <param name="pybullet" value="$(arg pybullet)" type="bool" />
+    <param name="test_path" value="$(arg test_path)" type="string" />
+    <param name="dt" value="$(arg dt)" type="double" />
+    <param name="save_fingerprint" value="$(arg save_fingerprint)" type="bool" />
+    <param name="fingerprint_name" value="$(arg fingerprint_name)" type="string" />
+    <param name="render_pybullet" value="$(arg render_pybullet)" type="bool" />
+    <param name="cam_z" value="$(arg cam_z)" type="double" />
+    <param name="test_config_file" value="$(arg test_config_file)" type="str" />
+    <param name="save_folder" value="$(arg save_folder)" type="string" />
+    <param name="skip" value="$(arg skip)" type="int" />
+    <param name="sensor_method" value="$(arg sensor_method)" type="string" />
+    <param name="num_steps" value="$(arg num_steps)" type="int" />
+
+    <!-- conditional params -->
+    <param name="row_res" value="5" type="int"/>
+    <param name="grid_size" value="0.15" type="double" />
+
+    <group if="$(eval arg('loc')=='center')">
+      <param name="start_x" value="0.475" type="double" />
+      <param name="start_y" value="0." type="double" />
+    </group>
+
+    <group if="$(eval arg('loc')=='bottom_right')">
+      <param name="start_x" value="0.54" type="double" />
+      <param name="start_y" value="-0.07" type="double" />
+    </group>
+
+    <group if="$(eval arg('loc')=='bottom_left')">
+      <param name="start_x" value="0.39" type="double" />
+      <param name="start_y" value="-0.12" type="double" />
+    </group>
+
+    <group if="$(eval arg('loc')=='top_left')">
+      <param name="start_x" value="0.36" type="double" />
+      <param name="start_y" value="0.09" type="double" />
+    </group>
+
+    <group if="$(eval arg('loc')=='top_right')">
+      <param name="start_x" value="0.54" type="double" />
+      <param name="start_y" value="0.09" type="double" />
+    </group>
+
+    <!-- test nodes -->
+    <node name="sensor_test_set" pkg="franka_test" type="sensor_test_set" respawn="false" output="screen" required="true"/>
+
+    <!-- image nodes -->
+    <group if="$(eval (arg('sensor_method')=='rgb') or (arg('sensor_method')=='intensity'))">
+      <arg name="img_name" value="/usb_cam/image_raw" />
+
+      <node name="republish" type="republish" pkg="image_transport" output="screen" args="compressed in:=$(arg img_name) raw out:=/usb_cam/image" unless="$(arg pybullet)"/>
+
+      <!-- <node name="republish" type="republish" pkg="image_transport" output="screen" args="compressed in:=$(arg img_name) raw out:=/usb_cam/image_raw" if="$(arg pybullet)"/> -->
+    </group>
+
+    <!-- <node name="pybullet_service" pkg="franka_test" type="pybullet_service" respawn="false" output="log" if="$(arg pybullet)" /> -->
+
+    <!-- gui -->
+    <node name="gui" pkg="franka_test" type="gui" respawn="false" output="screen" if="$(arg use_gui)" />
+
+</launch>

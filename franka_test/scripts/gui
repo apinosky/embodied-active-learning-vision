@@ -1,0 +1,375 @@
+#!/usr/bin/env python
+
+import tkinter as tk
+import tkinter.font as tkfont
+import rospy
+from franka_msgs.msg import ErrorRecoveryActionGoal
+from std_msgs.msg import Empty
+from std_srvs.srv import Empty as EmptyService
+from termcolor import cprint
+import os
+import signal
+import argparse
+import threading
+from franka_test.srv import UpdateVel,UpdateState
+from geometry_msgs.msg import Quaternion, PoseStamped, Twist, Point
+try:
+    from dist_modules.sensor_utils import from_vector4
+except:
+    def from_vector4(msg):
+        return np.array([msg.x, msg.y, msg.z, msg.w])
+import tf
+import numpy as np
+import time
+
+class testGUI():
+    def __init__(self,cam_z = 0.4):
+
+        self.cam_z = cam_z
+        # ros
+        rospy.init_node('gui', anonymous=True)
+        rospy.Subscriber('/update_processes',Empty,self.update_process_callback)
+        self.recover_pub = rospy.Publisher('/franka_control/error_recovery/goal',ErrorRecoveryActionGoal,queue_size=1) #,latch=True)
+        self.tare_pub = rospy.ServiceProxy('/Bias_sensor', EmptyService)
+        self.reset_pub = rospy.Publisher('/reset',Empty,queue_size=1)
+        self.reset_joints_pub = rospy.Publisher('/reset_joints',Empty,queue_size=1)
+        self.reset_ctrls_pub = rospy.Publisher('/reset_control_commands',Empty,queue_size=1)
+        self.pause_pub = rospy.Publisher('/pause',Empty,queue_size=1)
+        self.gui_pause_pub = rospy.Publisher('/gui_pause',Empty,queue_size=1,latch=False)
+        self.resume_pub = rospy.Publisher('/resume',Empty,queue_size=1)
+        self.gui_resume_pub = rospy.Publisher('/gui_resume',Empty,queue_size=1,latch=False)
+        self.manual_pub = rospy.Publisher('/manual',Empty,queue_size=1)
+        self.disable_manual_pub = rospy.Publisher('/disable_manual',Empty,queue_size=1)
+        self.save_pub = rospy.Publisher('/save',Empty,queue_size=1)
+        self.start_pose_controller = rospy.Publisher("/switch_to_pose_controller",Empty,queue_size=1)
+        self.start_vel_controller = rospy.Publisher("/switch_to_vel_controller",Empty,queue_size=1)
+
+        self.cam_z = rospy.get_param('cam_z', '0.4')
+
+        self.master = tk.Tk()  # create parent window
+        #base_path = rospy.get_param('base_path', './')
+        base_path = os.path.dirname(os.path.realpath(__file__)) + '/../'
+        self.icon_img = tk.Image("photo", file=base_path+"/config/gui.png")
+        self.master.tk.call('wm','iconphoto',self.master._w,self.icon_img)
+        self.master.title('ROS Publisher GUI')
+        self.root = tk.Frame(self.master)
+        myFont = tkfont.Font(size=16)
+
+        robot = tk.Label(self.root, text="GENERAL COMMANDS", font=myFont)
+        robot.grid(row=0,column=0,columnspan = 4, pady=5)
+
+        self.buttons = argparse.Namespace()
+
+        self.buttons.popup = tk.Button(self.root, text="i", command=self.popup_win,bg='black',fg='white',font=('Arial Black',10,'bold'))
+        self.buttons.popup.grid(row=0,column=3, padx=5, pady=5, sticky='e')
+
+
+        self.buttons.pause = tk.Button(self.root, text="PAUSE", command=self.pause,bg='#800000',fg='white',font=myFont,width=7)
+        self.buttons.pause.grid(row=1,column=0, padx=5, pady=5, columnspan = 2)
+
+        self.buttons.resume = tk.Button(self.root, text="RESUME", command=self.resume,bg='#008000',fg='white',font=myFont,width=7)
+        self.buttons.resume.grid(row=1,column=2, padx=5, pady=5, columnspan = 1)
+
+        self.buttons.save = tk.Button(self.root, text="SAVE", command=self.save,bg='#CCCCFF',font=myFont,width=7)
+        self.buttons.save.grid(row=1,column=3, padx=5, pady=5)
+
+        ctrls = tk.Label(self.root, text="ROBOT",font=myFont)
+        ctrls.grid(row=2,column=0, columnspan = 4, pady=3)
+
+        self.buttons.reset = tk.Button(self.root, text="RESET EE", command=self.reset,bg='#FF7F50',font=myFont,width=6)
+        self.buttons.reset.grid(row=4,column=2, padx=5, pady=5, columnspan = 2)
+
+        self.buttons.reset_joints = tk.Button(self.root, text="RESET JNTS", command=self.reset_joints,bg='#FF7F50',font=myFont,width=8)
+        self.buttons.reset_joints.grid(row=4,column=0, padx=5, pady=5, columnspan = 3)
+
+        plane = tk.Label(self.root, text="PLANAR CORRECTION (POSE CRTL)",font=myFont)
+        plane.grid(row=5,column=0, pady=3, columnspan = 4)
+        self.buttons.level = tk.Button(self.root, text="LEVEL EE", command=self.level,bg='#b25838',font=myFont,width=7)
+        self.buttons.level.grid(row=6,column=0, padx=5, pady=0, columnspan = 3)
+
+        self.buttons.fix_z = tk.Button(self.root, text="FIX Z", command=self.fix_z,bg='#b25838',font=myFont,width=7)
+        self.buttons.fix_z.grid(row=6,column=2, padx=5, pady=0, columnspan = 2)
+
+        plane = tk.Label(self.root, text="MOVE EE (VEL CTRL)",font=myFont)
+        plane.grid(row=7,column=0, pady=3, columnspan = 4)
+
+        self.buttons.cw_roll = tk.Button(self.root, text="ROLL CW", command=lambda:self.move('+r'),bg='#333333',fg='white',font=myFont,width=7)
+        self.buttons.cw_roll.grid(row=8,column=2, padx=5, pady=0)
+        self.buttons.ccw_roll = tk.Button(self.root, text="ROLL CCW", command=lambda:self.move('-r'),bg='#333333',fg='white',font=myFont,width=7)
+        self.buttons.ccw_roll.grid(row=8,column=3, padx=5, pady=0)
+
+        self.buttons.cw_pitch = tk.Button(self.root, text="PITCH CW", command=lambda:self.move('+p'),bg='#333333',fg='white',font=myFont,width=7)
+        self.buttons.cw_pitch.grid(row=9,column=2, padx=5, pady=0)
+        self.buttons.ccw_pitch = tk.Button(self.root, text="PITCH CCW", command=lambda:self.move('-p'),bg='#333333',fg='white',font=myFont,width=7)
+        self.buttons.ccw_pitch.grid(row=9,column=3, padx=5, pady=0)
+
+        self.buttons.cw_yaw = tk.Button(self.root, text="YAW CW", command=lambda:self.move('+w'),bg='#333333',fg='white',font=myFont,width=7)
+        self.buttons.cw_yaw.grid(row=10,column=2, padx=5, pady=0)
+        self.buttons.ccw_yaw = tk.Button(self.root, text="YAW CCW", command=lambda:self.move('-w'),bg='#333333',fg='white',font=myFont,width=7)
+        self.buttons.ccw_yaw.grid(row=10,column=3, padx=5, pady=0)
+
+        self.buttons.plus_x = tk.Button(self.root, text="+X", command=lambda:self.move('+x'),bg='#333333',fg='white',font=myFont,width=2)
+        self.buttons.plus_x.grid(row=8,column=0, padx=2, pady=0)
+        self.buttons.minus_x = tk.Button(self.root, text="-X", command=lambda:self.move('-x'),bg='#333333',fg='white',font=myFont,width=2)
+        self.buttons.minus_x.grid(row=8,column=1, padx=2, pady=0)
+
+        self.buttons.plus_y = tk.Button(self.root, text="+Y", command=lambda:self.move('+y'),bg='#333333',fg='white',font=myFont,width=2)
+        self.buttons.plus_y.grid(row=9,column=0, padx=2, pady=0)
+        self.buttons.minus_y = tk.Button(self.root, text="-Y", command=lambda:self.move('-y'),bg='#333333',fg='white',font=myFont,width=2)
+        self.buttons.minus_y.grid(row=9,column=1, padx=2, pady=0)
+
+        self.buttons.plus_z = tk.Button(self.root, text="+Z", command=lambda:self.move('+z'),bg='#333333',fg='white',font=myFont,width=2)
+        self.buttons.plus_z.grid(row=10,column=0, padx=2, pady=0)
+        self.buttons.minus_z = tk.Button(self.root, text="-Z", command=lambda:self.move('-z'),bg='#333333',fg='white',font=myFont,width=2)
+        self.buttons.minus_z.grid(row=10,column=1, padx=2, pady=0)
+
+        self.buttons.recover = tk.Button(self.root, text="RECOVER", command=self.recover, bg='#FFBF00',font=myFont,width=7)
+        self.buttons.recover.grid(row=3,column=2, padx=5, pady=5, columnspan = 1)
+
+        ctrls = tk.Label(self.root, text="CONTROL",font=myFont)
+        ctrls.grid(row=11,column=0, columnspan = 4, pady=3)
+
+        self.buttons.vel_ctrl = tk.Button(self.root, text="VELOCITY", command=self.switch_to_vel_controller,bg='#702963',fg='white',font=myFont, width=7, height=1)
+        self.buttons.vel_ctrl.grid(row=12,column=0, padx=2, pady=5,columnspan=2)
+
+        self.buttons.pose_ctrl = tk.Button(self.root, text="POSE", command=self.switch_to_pose_controller, bg='#483248', fg='white',font=myFont, width=7, height=1)
+        self.buttons.pose_ctrl.grid(row=12,column=2, padx=2, pady=5,columnspan=1)
+
+        self.buttons.manual = tk.Button(self.root, text="MANUAL", command=self.manual,bg='#6495ED',font=myFont, width=7)
+        self.buttons.manual.grid(row=12,column=3, padx=2, pady=0,columnspan=1)
+        self.manual_enabled = False
+
+        self.buttons.reset_ctrls = tk.Button(self.root, text="CLEAR CMD", command=self.reset_ctrls,bg='#555555',fg='white',font=myFont, width=7, height=1)
+        self.buttons.reset_ctrls.grid(row=3,column=0, padx=5, pady=5, columnspan = 2)
+
+
+        self.buttons.tare_fts = tk.Button(self.root, text="TARE FTS", command=self.tare_fts, bg='#FFFBBB',font=myFont,width=7)
+        self.buttons.tare_fts.grid(row=3,column=3, padx=5, pady=5, columnspan = 1)
+
+        self.master.protocol('WM_DELETE_WINDOW', self.quit)  # root is your root window
+
+        self.root.pack()
+
+        self.master.resizable(False,False)
+
+
+    def update_process_callback(self,msg):
+        import psutil
+        p = psutil.Process()
+        node_name = rospy.get_name()
+        # print(f'***** {node_name} node ***** ',os.environ['OMP_NUM_THREADS'],p.cpu_affinity(),'*****')
+        ros_affinity = rospy.get_param('ros_affinity',{})
+        if node_name in ros_affinity.keys():
+            cores = ros_affinity[node_name]
+            p.cpu_affinity(cores)
+        # print(f'***** {node_name} node ***** ',os.environ['OMP_NUM_THREADS'],p.cpu_affinity(),'*****')
+
+    def enable_button(self,button):
+        button['state'] = 'normal'
+
+    def disable_button(self,button):
+        button['state'] = 'disabled'
+
+    def start(self):
+        self.master.mainloop()
+
+    def tare_fts(self):
+        self.tare_pub()
+
+    def recover(self):
+        self.recover_pub.publish()
+        cprint("[GUI] "+"sending error recovery message","grey","on_yellow")
+
+    def reset(self):
+        self.disable_button(self.buttons.reset)
+        self.reset_pub.publish()
+        cprint("[GUI] "+"sending reset message","grey","on_yellow")
+        threading.Timer( 3 , self.enable_button, args=[self.buttons.reset]).start() # blocks calling again for 3 seconds
+
+    def reset_joints(self):
+        self.disable_button(self.buttons.reset_joints)
+        self.reset_joints_pub.publish()
+        cprint("[GUI] "+"sending reset joints message","grey","on_yellow")
+        threading.Timer( 3 , self.enable_button, args=[self.buttons.reset_joints]).start() # blocks calling again for 3 seconds
+
+    def reset_ctrls(self):
+        self.reset_ctrls_pub.publish()
+        cprint("[GUI] "+"clearing control velocity","grey","on_yellow")
+
+    def pause(self):
+        # self.disable_button(self.buttons.pause)
+        self.gui_pause_pub.publish()
+        self.pause_pub.publish()
+        cprint("[GUI] "+"sending pause message","grey","on_yellow")
+        # threading.Timer( 1 , self.enable_button, args=[self.buttons.pause]).start() # blocks calling again for 1 seconds
+
+    def resume(self):
+        # self.disable_button(self.buttons.resume)
+        self.gui_resume_pub.publish()
+        self.resume_pub.publish()
+        cprint("[GUI] "+"sending resume message","grey","on_yellow")
+        # threading.Timer( 1 , self.enable_button, args=[self.buttons.resume]).start() # blocks calling again for 1 seconds
+
+    def level(self):
+        self.start_pose_controller.publish()
+        time.sleep(1)
+        send_cmd = rospy.ServiceProxy('/klerg_pose', UpdateState)
+        msg = rospy.wait_for_message('/ee_pose',PoseStamped,timeout=10)
+        cmd = msg.pose
+        current_quat = [cmd.orientation.x,cmd.orientation.y,cmd.orientation.z,cmd.orientation.w]
+        current_rot = tf.transformations.euler_from_quaternion(current_quat)
+        cmd.orientation = Quaternion(*tf.transformations.quaternion_from_euler(np.pi, 0.,current_rot[2]))
+        # print(msg)
+        pose = send_cmd(cmd,-1)
+        time.sleep(5.)
+        msg = rospy.wait_for_message('/ee_pose',PoseStamped,timeout=10)
+        # print(msg)
+        self.start_vel_controller.publish()
+        cprint("[GUI] "+"leveling gripper","grey","on_yellow")
+        # threading.Timer( 1 , self.enable_button, args=[self.buttons.resume]).start() # blocks calling again for 1 seconds
+
+    def fix_z(self):
+        self.start_pose_controller.publish()
+        time.sleep(1)
+        send_cmd = rospy.ServiceProxy('/klerg_pose', UpdateState)
+        msg = rospy.wait_for_message('/ee_pose',PoseStamped,timeout=10)
+        cmd = msg.pose
+        cmd.position.z = self.cam_z
+        # print(msg)
+        pose = send_cmd(cmd,-1)
+        time.sleep(5.)
+        msg = rospy.wait_for_message('/ee_pose',PoseStamped,timeout=10)
+        # print(msg)
+        self.start_vel_controller.publish()
+        cprint("[GUI] "+"fixing z of gripper","grey","on_yellow")
+        # threading.Timer( 1 , self.enable_button, args=[self.buttons.resume]).start() # blocks calling again for 1 seconds
+
+    def move(self,direction):
+        try:
+            send_cmd = rospy.ServiceProxy('/klerg_cmd', UpdateVel)
+        except rospy.ServiceException as e:
+            rospy.logwarn('unable to move ee -- resolve the following ServiceException before trying again\nrospy.service.ServiceException:{}'.format(e))
+        if direction[1] in "rpw":
+            msg = rospy.wait_for_message('/ee_pose',PoseStamped,timeout=10)
+            quat = from_vector4(msg.pose.orientation)
+            R = tf.transformations.quaternion_matrix(quat)[:3,:3].T
+        cmd = Twist()
+        cmd_sign = 1. if "+" in direction else -1.
+        if "x" in direction:
+            cmd.linear.x = 0.1*cmd_sign
+        elif "y" in direction:
+            cmd.linear.y = 0.1*cmd_sign
+        elif "z" in direction:
+            cmd.linear.z = 0.1*cmd_sign
+        elif "r" in direction:
+            vec = np.dot(np.array([0.5*cmd_sign,0.,0.]), R)
+            cmd.angular = Point(*vec)
+        elif "p" in direction:
+            vec = np.dot(np.array([0.,0.5*cmd_sign,0.]),R)
+            cmd.angular = Point(*vec)
+        elif "w" in direction:
+            vec = np.dot(np.array([0.,0.,0.5*cmd_sign]),R)
+            cmd.angular = Point(*vec)
+        pose = send_cmd(cmd,-1)
+        cprint("[GUI] "+"moving gripper {}".format(direction),"grey","on_yellow")
+
+    def manual(self):
+        if self.manual_enabled:
+            self.disable_manual_pub.publish()
+            cprint("[GUI] "+"sending disable manual message","grey","on_yellow")
+            self.buttons.manual.config(bg='#6495ED',fg='black',text='MANUAL')
+        else:
+            self.manual_pub.publish()
+            cprint("[GUI] "+"sending enable manual message","grey","on_yellow")
+            self.buttons.manual.config(fg='#6495ED',bg='black',text='DISABLE\nMANUAL')
+        self.manual_enabled = not(self.manual_enabled)
+
+    def save(self):
+        self.disable_button(self.buttons.save)
+        self.save_pub.publish()
+        cprint("[GUI] "+"sending save message","grey","on_yellow")
+        threading.Timer( 5 , self.enable_button, args=[self.buttons.resume]).start() # blocks calling again for 5 seconds
+
+    def switch_to_pose_controller(self):
+        self.disable_button(self.buttons.pose_ctrl)
+        self.start_pose_controller.publish()
+        cprint("[GUI] "+"switching to pose control","grey","on_yellow")
+        threading.Timer( 1 , self.enable_button, args=[self.buttons.pose_ctrl]).start() # blocks calling again for 1 seconds
+
+    def switch_to_vel_controller(self):
+        self.disable_button(self.buttons.vel_ctrl)
+        self.start_vel_controller.publish()
+        cprint("[GUI] "+"switching to velocity control","grey","on_yellow")
+        threading.Timer( 1 , self.enable_button, args=[self.buttons.vel_ctrl]).start() # blocks calling again for 1 seconds
+
+    def quit(self,sig1=None,sig2=None):
+        self.root.quit()
+        self.root.destroy()
+        rospy.signal_shutdown('GUI shutdown')
+
+
+    def popup_win(self):
+        self.disable_button(self.buttons.popup)
+
+        msg = ''
+
+        msg += 'PAUSE     | Pauses the current test \n\t    (exploration/identification only, not model training)\n'
+        msg += 'RESUME    | Resumes the current test\n'
+        msg += 'SAVE      | Save a model/checkpoint at the current iteration\n'
+
+        msg += '\n'
+
+        msg += "CLEAR CMD | Final resort when recover EE doesn't work. Clears all\n\t   "
+        msg += ' stored values in ROS controller to allow clean commands.\n'
+        msg += 'RECOVER   | Sends a message to recover from franka error\n'
+        msg += 'TARE FTS  | Sends a message to bias force/torque sensor\n'
+
+        msg += '\n'
+
+        msg += 'RESET JNTS | Sends a message to reset the franka to default start joints.\n\t   '
+        msg += 'RESET EE  | Sends a message to reset the franka to the "start" pose.\n\t   '
+        msg += '(NOTE: This also enables the velocity controller. May\n\t   '
+        msg += ' take a couple attempts if robot is far from "start"\n\t   '
+        msg += ' pose.)\n'
+
+        msg += '\n'
+
+        msg += 'LEVEL EE  | Sends a message to level the franka gripper\n\t   (adjust pitch/roll).\n'
+        msg += 'FIX Z     | Sends a message to move the franka gripper to start z.\n'
+
+        msg += '\n'
+
+        msg += 'Robot can be controlled with pose/velocity commands or manually.If test program prompts that you have the wrong controller, you can reload proper franka controller by pressing POSE or VELOCITY.\n\n'
+
+        msg += 'MANUAL    | Currently only implemented for sensor_test_module. \n\t   '
+        msg += ' Allows user to manually manipulate the robot to explore \n\t   '
+        msg += ' the workspace when the e-stop is depressed. Note: must \n\t   '
+        msg += ' release e-stop and reset controller to fully resume \n\t   '
+        msg += ' non-manual control.\n'
+
+        self.popup = tk.Toplevel(self.master)
+        self.popup.tk.call('wm','iconphoto',self.popup._w,self.icon_img)
+        self.popup.title('Buttons Info')
+
+        label = tk.Label(self.popup, text=msg, wraplength=625, justify='left',font=('Arial',11,'bold'))
+        label.grid(row=1,column=0, padx=10, pady=10)
+
+        self.popup.resizable(False,False)
+
+        self.popup.protocol('WM_DELETE_WINDOW', self.close_popup)  # root is your root window
+
+    def close_popup(self):
+        self.enable_button(self.buttons.popup)
+        self.popup.destroy()
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cam_z', type=float, default=0.4, help='z value to use for leveling gripper')
+    args, unknown = parser.parse_known_args()
+
+    # setup node
+    gui = testGUI(args.cam_z)
+    signal.signal(signal.SIGINT, gui.quit)
+    gui.start()

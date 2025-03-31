@@ -1,0 +1,16 @@
+#!/usr/bin/env python
+
+import rospy
+from geometry_msgs.msg import Pose
+from franka_test.srv import UpdateState,UpdateStateResponse
+
+def callback(msg):
+    return UpdateStateResponse(msg.desired_pose,True)
+
+if __name__== '__main__':
+    rospy.init_node('DummyService')
+    rospy.Service('/klerg_pose',UpdateState,callback)
+    start = rospy.Publisher('/klerg_start_pose',Pose,queue_size=1,latch=True)
+    start.publish(Pose())
+    while not rospy.is_shutdown():
+        rospy.spin()

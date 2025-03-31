@@ -1,0 +1,23 @@
+---
+## general:
+DefaultPolicy: Roll # Roll, Zero, or LQR
+test_corners: False
+use_barrier: True
+force_thresh: 5
+barr_weight: 5. # 0.05
+position_barrier: True
+velocity_barrier: True
+## sampling:
+add_recent_history: False
+optimize_samples: False
+sample_near_current_loc: False
+weight_env: False
+weight_temp: True
+## step:
+ctrlAppSearch: True
+full_cost: False
+fixed_lam: False
+lam: 1
+saturate: False
+pct_of_horizon_for_inner_loop: 0.5 # 0.5
+alpha: 1.

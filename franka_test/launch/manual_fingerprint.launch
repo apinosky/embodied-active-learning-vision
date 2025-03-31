@@ -1,0 +1,101 @@
+<?xml version="1.0" ?>
+
+<launch>
+    <arg name="pybullet" default ="False" />
+    <arg name="render_pybullet" default ="True" />
+    <arg name="dt" default="0.1"/>
+    <arg name="cam_z" default="0.46" doc="currently only used for pybullet"/>
+    <arg name="sensor_method" default="rgb"/>
+
+    <arg name="test_method" default="explr" doc="circle grid or explr"/>
+    <arg name="save_fingerprint" default="True"/>
+    <arg name="test_path" default="data/rgb/entklerg_0001_ddp_2obj_z16_newlights_trainMulti" doc="path relative to franka_test directory"/>
+    <arg name="fingerprint_name" default="block" doc="blank ball or block"/>
+    <arg name="model_path" default="model_final.pth" doc="name of model to test"/>
+    <arg name="explr_states" default="xy" doc="states to explore"/>
+    <arg name="save_folder" default="eval/" doc="where to save fingerprints"/>
+
+    <arg name="circle_radius" default="0.05" doc="only if used test_method=circle"/>
+    <arg name="grid_size" default="0.1" doc="only if used test_method=grid"/>
+    <arg name="fixed_seed" default="False"/>
+    <arg name="start_camera" default="False"/>
+
+    <!-- params -->
+    <param name="base_path" value="$(find franka_test)" type="string" />
+    <param name="pybullet" value="$(arg pybullet)" type="bool" />
+    <param name="test_path" value="$(arg test_path)" type="string" />
+    <param name="dt" value="$(arg dt)" type="double" />
+    <param name="test_method" value="$(arg test_method)" type="string" />
+    <param name="circle_radius" value="$(arg circle_radius)" type="double" />
+    <param name="grid_size" value="$(arg grid_size)" type="double" />
+    <param name="fixed_seed" value="$(arg fixed_seed)" type="bool" />
+    <param name="save_fingerprint" value="$(arg save_fingerprint)" type="bool" />
+    <param name="fingerprint_name" value="$(arg fingerprint_name)" type="string" />
+    <param name="render_pybullet" value="$(arg render_pybullet)" type="bool" />
+    <param name="cam_z" value="$(arg cam_z)" type="double" />
+    <param name="model_path" value="$(arg model_path)" type="string" />
+    <param name="explr_states" value="$(arg explr_states)" type="string" />
+    <param name="save_folder" value="$(arg save_folder)" type="string" />
+    <param name="sensor_method" value="$(arg sensor_method)" type="string" />
+
+    <!-- conditional params -->
+    <param name="num_steps" value="49" type="int" unless="$(eval arg('test_method')=='explr')"/>
+    <param name="num_steps" value="50" type="int" if="$(eval arg('test_method')=='explr')"/>
+    <!-- blank -->
+    <!-- <arg name="start_x" default="0.58"/> -->
+    <!-- <arg name="start_y" default="0.1"/> -->
+    <!-- <arg name="fingerprint_name" default="blank"/> -->
+    <!-- block -->
+    <!-- <arg name="start_x" default="0.56"/> -->
+    <!-- <arg name="start_y" default="-0.125"/> -->
+    <!-- <arg name="fingerprint_name" default="block"/> -->
+    <!-- ball -->
+    <!-- <arg name="start_x" default="0.38"/> -->
+    <!-- <arg name="start_y" default="0.035"/> -->
+    <!-- <arg name="fingerprint_name" default="ball"/> -->
+    <!-- <group if="$(eval arg('fingerprint_name')=='blank')">
+      <param name="start_x" value="0.58" type="double" />
+      <param name="start_y" value="0.15" type="double" />
+    </group>
+    <group if="$(eval (arg('fingerprint_name')=='ball') or (arg('fingerprint_name')=='duck' ))">
+      <param name="start_x" value="0.56" type="double" />
+      <param name="start_y" value="-0.13" type="double" />
+    </group>
+    <group if="$(eval (arg('fingerprint_name')=='block') or (arg('fingerprint_name')=='plant'))">
+      <param name="start_x" value="0.38" type="double" />
+      <param name="start_y" value="0.06" type="double" />
+    </group> -->
+    <!-- <group if="$(eval arg('fingerprint_name')=='blank2')">
+      <param name="start_x" value="0.38" type="double" />
+      <param name="start_y" value="-0.1" type="double" />
+    </group> -->
+
+    <group if="$(eval (arg('fingerprint_name')=='blank') or (arg('fingerprint_name')=='blank2'))">
+      <param name="start_x" value="0.58" type="double" />
+      <param name="start_y" value="0.1" type="double" />
+    </group>
+    <group if="$(eval (arg('fingerprint_name')=='ball') or (arg('fingerprint_name')=='plant')  or (arg('fingerprint_name')=='plant2'))">
+      <param name="start_x" value="0.58" type="double" />
+      <param name="start_y" value="-0.1" type="double" />
+    </group>
+    <group if="$(eval (arg('fingerprint_name')=='block') or (arg('fingerprint_name')=='duck') or (arg('fingerprint_name')=='duck2'))">
+      <param name="start_x" value="0.38" type="double" />
+      <param name="start_y" value="0.12" type="double" />
+    </group>
+
+    <!-- test nodes -->
+    <node name="build_manual_fingerprints" pkg="franka_test" type="build_manual_fingerprints" respawn="false" output="screen" required="true"/>
+
+    <!-- image nodes -->
+    <group if="$(eval (arg('sensor_method')=='rgb') or (arg('sensor_method')=='intensity'))">
+      <arg name="img_name" value="/usb_cam/image_raw" />
+
+      <node name="republish" type="republish" pkg="image_transport" output="screen" args="compressed in:=$(arg img_name) raw out:=/usb_cam/image" unless="$(arg pybullet)"/>
+
+      <node name="republish" type="republish" pkg="image_transport" output="screen" args="compressed in:=$(arg img_name) raw out:=/usb_cam/image_raw" if="$(arg pybullet)"/>
+      <include file="$(find franka_test)/launch/start_camera.launch" if="$(arg start_camera)"/>
+    </group>
+
+    <!-- <node name="pybullet_service" pkg="franka_test" type="pybullet_service" respawn="false" output="log" if="$(arg pybullet)" /> -->
+
+</launch>

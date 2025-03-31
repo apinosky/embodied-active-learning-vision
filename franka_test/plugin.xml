@@ -1,0 +1,30 @@
+<library path="lib/libfranka_test">
+    <class  name="franka_test/CartesianStateInterface"
+            type="franka_test::CartesianStateInterface"
+            base_class_type="controller_interface::ControllerBase">
+    <description>
+        Cartesion state interface
+    </description>
+    </class>
+    <class  name="franka_test/CartesianPoseInterface"
+            type="franka_test::CartesianPoseInterface"
+            base_class_type="controller_interface::ControllerBase">
+    <description>
+        Cartesion pose interface
+    </description>
+    </class>
+    <class  name="franka_test/CartesianVelInterface"
+            type="franka_test::CartesianVelInterface"
+            base_class_type="controller_interface::ControllerBase">
+    <description>
+        Cartesion velocity interface
+    </description>
+    </class>
+    <class  name="franka_test/JointPositionInterface"
+            type="franka_test::JointPositionInterface"
+            base_class_type="controller_interface::ControllerBase">
+    <description>
+        Joint pose interface
+    </description>
+    </class>
+</library>

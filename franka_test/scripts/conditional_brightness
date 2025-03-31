@@ -1,0 +1,45 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import rospy
+from std_msgs.msg import Float32
+from franka_test.msg import BrightnessStamped
+import time
+import os
+
+class BrightnessListener(object):
+
+    def __init__(self):
+        ### Setup Ros Env ###
+        rospy.init_node('BrightnessListener')
+        self.device = rospy.get_param('/usb_cam/video_device', '/dev/video0')
+        self.current_brightness = 0.5 # starting
+        self.max_brightness = 255
+        self.update_brightness(self.current_brightness) # reset
+        self.brightness_pub = rospy.Publisher('/usb_cam/brightness',BrightnessStamped,queue_size=1,latch=False)
+        rospy.Timer(rospy.Duration(1/30.), self.publishBrightness) # 30 hz
+        rospy.Subscriber('/update_brightness',Float32,self.brightness_callback)
+
+    def brightness_callback(self,msg):
+        brightness = msg.data
+        # update
+        self.update_brightness(brightness)
+        # store
+        self.current_brightness = brightness
+
+    def update_brightness(self,brightness):
+        # clip
+        brightness = int(min(self.max_brightness,brightness*self.max_brightness))
+        os.system("v4l2-ctl -d {} -c brightness={}".format(self.device,brightness))
+
+    def publishBrightness(self,event):
+        msg = BrightnessStamped()
+        msg.brightness = self.current_brightness
+        msg.header.frame_id = 'usb_cam'
+        msg.header.stamp = rospy.Time.now()
+        self.brightness_pub.publish(msg)
+
+if __name__== '__main__':
+    listener = BrightnessListener()
+    while not rospy.is_shutdown():
+        rospy.spin()

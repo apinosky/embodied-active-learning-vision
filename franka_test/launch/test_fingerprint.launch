@@ -1,0 +1,75 @@
+<?xml version="1.0" ?>
+
+<launch>
+    <arg name="use_gui" default ="False" />
+    <arg name="pybullet" default ="False" />
+    <arg name="render_pybullet" default ="True" />
+    <arg name="dt" default="0.1"/>
+    <arg name="sensor_method" default="rgb"/>
+
+    <arg name="fingerprint_names" default="ball_block_blank"/>
+    <arg name="fingerprint_method" default="grid" doc="grid or explr"/>
+
+    <arg name="num_steps" default="500"/>
+    <arg name="cam_z" default="0.46"/>
+    <arg name="save_name" default="test_fingerprints/unif_grid500"/>
+    <arg name="test_path" default="data/rgb/entklerg_0001_ddp_2obj_z16_newlights_trainMulti" doc="path relative to franka_test directory"/>
+    <arg name="fingerprint_path" default="eval/" doc="path relative to test_path"/>
+    <arg name="model_path" default="model_final.pth" doc="name of model to test"/>
+    <arg name="explr_states" default="xy" doc="states to explore"/>
+    <arg name="update_tdist_step" default="200" doc="when to send new distribution to explorer"/>
+    <arg name="new_model_explr" default="False" doc="use VAE for exploration"/>
+    <arg name="clustering" default ="False" />
+    <arg name="test_config_file" default="fp_trainer_config.yaml"/>
+    <arg name="belief_plotting_rate" default="100"/>
+    <arg name="async" default="True"/>
+
+    <!-- params -->
+    <param name="base_path" value="$(find franka_test)" type="string" />
+    <param name="pybullet" value="$(arg pybullet)" type="bool" />
+    <param name="test_path" value="$(arg test_path)" type="string" />
+    <param name="dt" value="$(arg dt)" type="double" />
+    <param name="save_name" value="$(arg save_name)" type="string" />
+    <param name="num_steps" value="$(arg num_steps)" type="int" />
+    <param name="fingerprint_names" value="$(arg fingerprint_names)" type="string" />
+    <param name="fingerprint_method" value="$(arg fingerprint_method)" type="string" />
+    <param name="render_pybullet" value="$(arg render_pybullet)" type="bool" />
+    <param name="cam_z" value="$(arg cam_z)" type="double" />
+    <param name="model_path" value="$(arg model_path)" type="string" />
+    <param name="explr_states" value="$(arg explr_states)" type="string" />
+    <param name="fingerprint_path" value="$(arg fingerprint_path)" type="string" />
+    <param name="update_tdist_step" value="$(arg update_tdist_step)" type="int" />
+    <param name="new_model_explr" value="$(arg new_model_explr)" type="bool" />
+    <param name="test_config_file" value="$(arg test_config_file)" type="str" />
+    <param name="belief_plotting_rate" value="$(arg belief_plotting_rate)" type="int" />
+    <param name="async" value="$(arg async)" type="bool" />
+    <param name="sensor_method" value="$(arg sensor_method)" type="string" />
+  
+    <!-- test nodes -->
+    <node name="fingerprint_mp" pkg="franka_test" type="fingerprint_mp" respawn="false" output="screen" required="true"/>
+
+    <!-- clustering node -->
+    <group if="$(arg new_model_explr)">
+      <node name="clustering" pkg="franka_test" type="clustering" respawn="false" output="screen" required="false" if="$(arg clustering)"/>
+    </group>
+
+    <!-- auto-recovery node -->
+    <node name="random_listener" pkg="franka_test" type="random_listener" respawn="false" output="screen" required="false" unless="$(arg pybullet)">
+        <param name="fix_ee"   type="bool" value="True" />
+    </node>
+     <!-- unless="$(eval explr_method == 'entklerg')"/> -->
+     
+    <!-- image nodes -->
+    <group if="$(eval (arg('sensor_method')=='rgb') or (arg('sensor_method')=='intensity'))">
+      <arg name="img_name" value="/usb_cam/image_raw" />
+
+      <node name="republish" type="republish" pkg="image_transport" output="screen" args="compressed in:=$(arg img_name) raw out:=/usb_cam/image" unless="$(arg pybullet)"/>
+
+      <!-- <node name="republish" type="republish" pkg="image_transport" output="screen" args="compressed in:=$(arg img_name) raw out:=/usb_cam/image_raw" if="$(arg pybullet)"/> -->
+    </group>
+
+    <!-- <node name="pybullet_service" pkg="franka_test" type="pybullet_service" respawn="false" output="log" if="$(arg pybullet)" /> -->
+
+    <node name="gui" pkg="franka_test" type="gui" respawn="false" output="screen" if="$(arg use_gui)" />
+
+</launch>

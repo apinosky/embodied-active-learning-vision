@@ -1,0 +1,5 @@
+geometry_msgs/Twist desired_vel
+float32 desired_brightness
+---
+geometry_msgs/Pose actual_pose
+bool success

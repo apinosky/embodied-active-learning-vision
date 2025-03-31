@@ -1,0 +1,5 @@
+# melodic.rosinstall
+
+- git: {local-name: panda_moveit_config, uri: https://github.com/ros-gbp/panda_moveit_config-release.git, version: melodic-devel}
+- git: {local-name: franka_ros, uri: 'git@github.com:frankaemika/franka_ros.git', version: 0.9.0} # for melodic computers only
+- git: {local-name: ati_netft_ros_driver, uri: 'git@github.com:apinosky/ati_netft_ros_driver.git', version: melodic-devel}

@@ -1,0 +1,33 @@
+<?xml version="1.0" ?>
+
+<launch>
+    <arg name="use_gui" default ="False" />
+    <arg name="pybullet" default ="False" />
+    <arg name="render_pybullet" default ="True" />
+    <arg name="square" default="False"/>
+    <arg name="dt" default="0.1"/>
+
+    <arg name="cam_z" default="0.46"/>
+    <arg name="save_name" default="test_fingerprints/"/>
+    <arg name="test_path" default="data/rgb/entklerg_0001_ddp_2obj_z16_newlights_trainMulti" doc="path relative to franka_test directory"/>
+
+    <!-- params -->
+    <param name="base_path" value="$(find franka_test)" type="string" />
+    <param name="pybullet" value="$(arg pybullet)" type="bool" />
+    <param name="test_path" value="$(arg test_path)" type="string" />
+    <param name="dt" value="$(arg dt)" type="double" />
+    <param name="save_name" value="$(arg save_name)" type="string" />
+    <param name="render_pybullet" value="$(arg render_pybullet)" type="bool" />
+    <param name="cam_z" value="$(arg cam_z)" type="double" />
+    <param name="square" value="$(arg square)" type="bool" />
+
+    <!-- test nodes -->
+    <node name="capture_ws" pkg="franka_test" type="capture_ws" respawn="false" output="screen" required="true"/>
+
+    <node name="republish" type="republish" pkg="image_transport" output="screen" args="compressed in:=/usb_cam/image_raw raw out:=/usb_cam/image" unless="$(arg pybullet)" />
+
+    <!-- <node name="pybullet_service" pkg="franka_test" type="pybullet_service" respawn="false" output="log" if="$(arg pybullet)" /> -->
+
+    <node name="gui" pkg="franka_test" type="gui" respawn="false" output="screen" if="$(arg use_gui)" />
+
+</launch>

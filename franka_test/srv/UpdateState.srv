@@ -1,0 +1,5 @@
+geometry_msgs/Pose desired_pose
+float32 desired_brightness
+---
+geometry_msgs/Pose actual_pose
+bool success

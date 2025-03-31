@@ -1,0 +1,126 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import rospy
+from std_msgs.msg import Empty
+from franka_msgs.msg import ErrorRecoveryActionGoal
+import time
+from franka_test.srv import UpdateState
+from geometry_msgs.msg import Quaternion, PoseStamped
+import tf
+import numpy as np
+
+class RandomListener(object):
+
+    def __init__(self):
+        ### Setup Ros Env ###
+        rospy.init_node('RandomListener')
+        rospy.wait_for_service('sensor_utils') # don't start this node until sensor_main / sensor_test is done setting up
+
+        self.reset_pub = rospy.Publisher('/franka_control/error_recovery/goal',ErrorRecoveryActionGoal,queue_size=1,latch=True)
+        self.resume_pub = rospy.Publisher('/resume',Empty,queue_size=1,latch=False)
+        self.pause_pub = rospy.Publisher('/pause',Empty,queue_size=10,latch=False)
+        self.pause = False
+        self.gui_pause = False
+        self.reset_ctrls_pub = rospy.Publisher('/reset_control_commands',Empty,queue_size=1)
+        self.last_reset = time.time()
+        fix_ee = rospy.get_param('~fix_ee', True)
+        if (not fix_ee):
+            self.fix_ee = False
+        else:
+            states = rospy.get_param('explr_states', 'xy')
+            self.fix_z = not ('z' in states)
+            self.level_ee = not('r' in states) and not('p' in states)
+            self.fix_ee = self.fix_z or self.level_ee
+        if self.fix_ee: 
+            self.cam_z = rospy.get_param('cam_z', '0.4')
+            self.send_cmd = rospy.ServiceProxy('/klerg_pose', UpdateState)
+        rospy.Timer(rospy.Duration(60.), self.publishResume) # publish resume once a minute to deal with master disconnect
+        rospy.Subscriber('/pause',Empty,self.pause_callback)
+        rospy.Subscriber('/gui_pause',Empty,self.gui_pause_callback)
+        rospy.Subscriber('/gui_resume',Empty,self.gui_resume_callback)
+        rospy.Subscriber('/ee_pose',PoseStamped,self.pose_callback)
+
+    def publishResume(self,event):
+        if time.time() - self.last_reset > 60*10.:
+            self.pause_callback(Empty,manual=True)
+
+    def pose_callback(self,msg):
+        self.curr_pose = msg.pose
+        if (not self.pause) and self.fix_ee and (not self.gui_pause):
+            cmd,error,current_z,current_rot = self.check_pose(msg.pose)
+            if error: 
+                self.pause = True
+                self.pause_pub.publish()
+                print('got ee_error, so pausing', current_z, current_rot)
+
+    def check_pose(self,cmd): 
+        error = False
+        current_z = None
+        current_rot = None
+        if self.fix_z: 
+            thresh = 0.01
+            current_z = cmd.position.z
+            diff = self.cam_z - current_z
+            error = error or (abs(diff) > thresh)
+            cmd.position.z = self.cam_z + np.sign(diff)*thresh/2.
+        if self.level_ee: 
+            current_quat = [cmd.orientation.x,cmd.orientation.y,cmd.orientation.z,cmd.orientation.w]
+            current_rot = tf.transformations.euler_from_quaternion(current_quat)
+            cmd.orientation = Quaternion(*tf.transformations.quaternion_from_euler(np.pi, 0.,current_rot[2]))
+
+            thresh = 0.05
+            roll = current_rot[0] % (2 * np.pi) # wrap btwn 0 and 2*pi
+            error = error or (abs(roll - np.pi) > thresh)
+
+            pitch = (current_rot[1] + np.pi) % (2 * np.pi) - np.pi # wrap btwn -pi and pi
+            error = error or (abs(pitch - 0.) > thresh)
+        return cmd,error,current_z,current_rot
+            
+
+    def pause_and_align(self): 
+        if not self.gui_pause:
+            self.reset_ctrls_pub.publish() # stop robot from moving
+            self.reset_pub.publish()
+            cmd,error,current_z,current_rot = self.check_pose(self.curr_pose)
+            num_attempts = 50
+            count = 0
+            while error and count < num_attempts: 
+                pose = self.send_cmd(cmd,-1)
+                if not pose.success:
+                    self.reset_pub.publish()
+                time.sleep(0.5)
+                cmd,error,current_z,current_rot = self.check_pose(self.curr_pose)
+                count += 1
+            if not error:
+                self.pause = False
+                self.pause_callback(Empty,manual=True)
+            else:
+                print('re-align failed')
+
+    def gui_pause_callback(self,msg):
+        self.gui_pause = True
+
+    def gui_resume_callback(self,msg):
+        self.gui_pause = False
+
+    def pause_callback(self,msg,manual=False):
+        if not self.pause and not self.gui_pause:
+            if time.time() - self.last_reset < 1:
+                self.reset_ctrls_pub.publish()
+                if not manual:
+                    print('[random listener] hard reset')
+            self.last_reset = time.time()
+            self.reset_pub.publish()
+            self.resume_pub.publish()
+            if not manual:
+                print('[random listener] reset')
+
+if __name__== '__main__':
+    listener = RandomListener()
+    rate = rospy.Rate(20)
+    while not rospy.is_shutdown():
+        if listener.pause:
+            listener.pause_and_align()
+        rate.sleep()
+        # rospy.spin()

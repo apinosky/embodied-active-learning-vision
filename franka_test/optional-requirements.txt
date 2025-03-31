@@ -1,0 +1,3 @@
+-f https://developer.intel.com/ipex-whl-stable-xpu
+oneccl-bind-pt==2.0.0
+py_libnuma #==1.2

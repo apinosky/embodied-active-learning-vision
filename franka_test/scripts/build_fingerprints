@@ -1,0 +1,346 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import numpy as np
+import numpy.random as npr
+import matplotlib.pyplot as plt
+import pickle
+import os
+import yaml
+
+import time
+from termcolor import cprint
+import rospy
+
+########## local imports ##########
+from franka.franka_utils import ws_conversion
+from plotting.plotting_matplotlib import Plotter, EvalPlotter
+from control.klerg_utils import *
+from dist_modules.sensor_utils import get_circular_traj, get_grid_traj
+from dist_modules.sensor_test_module import SensorTest, ExplrDist
+from dist_modules.fingerprint_builder import FingerprintBuilder
+
+if __name__== '__main__':
+
+    num_steps = rospy.get_param("num_steps", 12)
+    fixed_seed = rospy.get_param("fixed_seed", False)
+    save_fingerprint = rospy.get_param("save_fingerprint", False)
+    num_fingerprints = None
+    test_method = rospy.get_param("test_method", "grid")
+    save_folder = rospy.get_param("save_folder", "eval/")
+    model_path = rospy.get_param("model_path", "model_final.pth")
+    buffer_name = rospy.get_param("buffer_name", "explr_update_info.pickle")
+    explr_states = rospy.get_param("explr_states", "xyzw")
+    tdist_mode = rospy.get_param("tdist_mode", "sphere")
+    base_fp_name = rospy.get_param("base_fp_name", "fp")
+    test_path = rospy.get_param('test_path', 'data/intensity/entklerg_0000/')
+    base_path = rospy.get_param('base_path', './')
+    dir_path = base_path + '/' + test_path + '/'
+
+    # print(test_method,num_steps,base_fp_name)
+
+    if 'z' not in explr_states and tdist_mode == 'cone':
+        print("switching tdist method to uniform. 'z' required to use cone method")
+        tdist_mode = 'uniform'
+
+    if 'z' not in explr_states and tdist_mode == 'cylinder':
+        print("switching tdist method to uniform. 'z' required to use cylinder method")
+        tdist_mode = 'uniform'
+
+    fp = FingerprintBuilder(dir_path=dir_path,model_path=model_path,buffer_name=buffer_name)
+
+    # set up modules
+    target_dist = ExplrDist(explr_idx=np.arange(len(explr_states)))
+    target_dist.init = True
+
+    test = SensorTest(target_dist if test_method == 'explr' else None,num_steps=num_steps,init_vel=False)
+
+    if test.learn_force:
+        raise NotImplementedError('need to add force stuff here')
+
+    test.vel_states = not (explr_states == explr_states.lower()) # check for capital letters
+    if test.vel_states:
+        raise NotImplementedError('need to add velocity stuff here')
+
+    ## save start_pos
+    pos = ws_conversion(test.xinit,test.robot_lim,test.tray_lim)
+
+    ## get explr_idx
+    explr_idx =[]
+    preferred_order = 'xyzw'
+    for state in preferred_order:
+        if state in explr_states:
+            explr_idx.append(test.states.rfind(state))
+
+    ## get fingerprints
+    cprint('[TEST] getting fingerprints','cyan')
+    if os.path.exists(test.dir_path+save_folder) == False:
+        os.makedirs(test.dir_path+save_folder)
+    fp_name = test.dir_path+save_folder+base_fp_name+'_locs'
+    cluster_by_plot_idx = False
+    fp_locs,fp_figs = fp.find_clusters(num_fingerprints,fp_name,cluster_by_plot_idx=cluster_by_plot_idx)
+
+    ## visualize fingerprints
+    # visualize_fp = input('Do you want to see the fingerprints? Y/N (N will skip robot visualization) ')
+    visualize_fp = 'n'
+    tmp_plots = []
+    if not('n' in visualize_fp.lower()):
+        cprint('[TEST] visualizing fingerprints','cyan')
+        for fp_id,center in enumerate(fp_locs):
+            fingerprint_name = f'{base_fp_name}{fp_id}'
+
+            fp_pos = pos.copy()
+            fp_pos[test.plot_idx[0]] = center[0]
+            fp_pos[test.plot_idx[1]] = center[1]
+            print(fp_pos)
+
+            # go to start location
+            test.use_pose() # switch back to pose controller
+            at_center = test.check_goal_pos(fp_pos,-1)
+            iter_step = 0
+            while iter_step < 10:
+                if test.got_state and test.got_img and not(test.pause):
+                    success,out = test.step(0,pos=fp_pos)
+                    if success:
+                        iter_step += 1
+
+            # view location
+            x,y,force = out
+            y_pred,latent_space = fp.init_model(x,y,force)
+
+            # plot
+            tmp_plot = EvalPlotter(path=test.dir_path,sim=test.pybullet,method=test.explr_method,save_folder=save_folder,render=fp.render_figs)
+            tmp_plot.update(fp.reshape(y),fp.reshape(y),fp.reshape(y_pred.squeeze()),latent_space)
+            tmp_plot.save(f'center_{fingerprint_name}')
+            tmp_plots.append(tmp_plot)
+
+    # if fp.render_figs:
+    #     input_msg = input('Do the fingerprints look ok? Y/N (N will exit) ')
+    # else:
+    input_msg = 'y'
+
+    for tmp_plot in tmp_plots:
+        tmp_plot.close()
+
+    cprint('[TEST] closing fingerprint figs','cyan')
+
+    if not( 'n' in input_msg.lower() ):
+        plot = EvalPlotter(path=test.dir_path,sim=test.pybullet,method=test.explr_method,save_folder=save_folder+'fp_figs/',render=fp.render_figs)
+        fig1 = False
+
+        for fp_id,center in enumerate(fp_locs):
+            fingerprint_name = f'{base_fp_name}{fp_id}'
+
+            # get trajectory
+            if test_method == 'circle':
+                circle_radius = rospy.get_param("circle_radius", 0.06)
+                test_traj = get_circular_traj(radius=circle_radius,num_points=num_steps,center=center)
+                use_vel = False
+            elif test_method == 'grid':
+                grid_size = rospy.get_param("grid_size", 0.01)
+                test_traj = get_grid_traj(grid_size=grid_size,num_points=num_steps,center=center)
+                use_vel = False
+            elif test_method == 'explr':
+                test_traj = np.array([center])
+                use_vel = True
+            if not (cluster_by_plot_idx) and (test_method == 'explr'):
+                new_traj = test_traj.copy()
+            else:
+                # reshape xy to full state
+                new_traj = pos[None,:].repeat(len(test_traj),0)
+                new_traj[:,test.plot_idx[0]] = test_traj[:,0]
+                new_traj[:,test.plot_idx[1]] = test_traj[:,1]
+
+            # set seed / go to start location
+            if fixed_seed:
+                success,[x,y,force] = test.step(0,pos=new_center)
+                y_pred,init_model = fp.init_model(x,y,force)
+                seed = fp.reshape(y)
+                plot.update(seed,fp.reshape(y),fp.reshape(y_pred.squeeze()))
+                plot.save(f'seed_{fingerprint_name}')
+            else:
+                cprint('[TEST] moving to next fingerprint','cyan')
+                new_center = new_traj[0].copy()
+                test.use_pose() # switch back to pose controller
+                at_center = test.check_goal_pos(new_center,-1)
+                if not at_center: 
+                    cprint("[TEST] didn't make it to the starting pose","cyan")
+
+            time.sleep(0.2)
+            # reshape xy to full state in robot world
+            print(pos)
+            if not (cluster_by_plot_idx) and (test_method == 'explr'):
+                new_center = test_traj[0]
+            else:
+                new_center = pos.copy()
+                new_center[test.plot_idx[0]] = center[0]
+                new_center[test.plot_idx[1]] = center[1]
+            robot_center = ws_conversion(new_center, test.tray_lim, test.robot_lim)
+
+            # set target dist location
+            if test_method == 'explr':
+                if fp_id == 0:
+                    msg = f'tdist_method = {tdist_mode}'
+                    with open(fp.save_name + ".txt","a") as f:
+                        f.write(msg+'\n')
+
+                target_dist.reset()
+                if tdist_mode == 'cone':
+                    tip_of_cone = np.ones(3)
+                    tip_of_cone[0] = robot_center[0]
+                    tip_of_cone[1] = robot_center[1]
+                    tip_of_cone[2] = 0.5
+                    num_samps = 500
+                    R = 0.2
+                    H = 1.5 #  < (v2) 2.0  < (v1)
+                    samps = npr.uniform(np.zeros(3),np.array([np.pi*2,H,R]),size=(num_samps,3))
+                    phi=samps[:,0]
+                    h = samps[:,1]
+                    r = samps[:,2]
+                    if tdist_mode == 'cone':
+                        r = np.clip(r,0,R*h/H)
+                    elif tdist_mode == 'cylinder':
+                        # r = R # surface only
+                        r = np.clip(r,0,R)
+                    points = tip_of_cone[:,None]-np.array([r*np.cos(phi),r*np.sin(phi),h])
+
+                    for pt in points.T:
+                        full_state = robot_center.copy()
+                        full_state[:3] = pt
+                        vals = np.ones(len(explr_states))
+                        vals[:3] *= -(pt[-1] - 1)*0.025
+                        vals[3:] *= np.pi
+                        target_dist.push(full_state,vals)
+                elif tdist_mode == 'sphere' or tdist_mode == 'cylinder':
+                    msgs = []
+                    vals = np.ones(len(explr_states))
+                    locs = robot_center[explr_idx].copy()
+                    for idx,state in enumerate(explr_states):
+                        if state in 'xyz':
+                            if (tdist_mode == 'cylinder') and (state == 'z'):
+                                vals[idx] *= 2
+                                locs[idx] = 0. # center z
+                            else:
+                                vals[idx] *= 0.01
+                            msgs.append(f'\t{state} scale = {vals[idx]}')
+                        else:
+                            vals[idx] *= 2
+                            locs[idx] = 0. # center angles
+                            msgs.append(f'\t{state} scale = {vals[idx]}')
+                    target_dist.push(locs,vals)
+                    if fp_id == 0:
+                        for msg in msgs:
+                            with open(fp.save_name + ".txt","a") as f:
+                                f.write(msg+'\n')
+
+                test.start_explr(robot_center[explr_idx],explr_states=explr_states)
+                test.robot.weight_env = False
+                test.robot.weight_temp = False
+                test.robot.test(test.num_target_samples)
+                if tdist_mode in ['uniform','sphere','cylinder']:
+                    skip = rospy.get_param("skip", 1)
+                    plot_dim_scale = 0.4
+                    test.robot.std[:] = test.std / 10.
+                    # overwrite tray lims so boundaries keep it near the object
+                    new_lims = robot_center[test.plot_idx][:,None] + np.array([-1.,1.])*plot_dim_scale
+
+                    test.robot.update_lims(test.plot_idx,new_lims)
+                    # test.robot.barrier.barr_weight[test.plot_idx[0]] = 0. 
+                    # test.robot.barrier.barr_weight[test.plot_idx[1]] = 0. 
+                    test.robot.test_corners = False
+
+                    # print('new explr lims',test.robot.lims)
+                    if fp_id == 0:
+                        msg = f'plot_dim scale = {plot_dim_scale}'
+                        with open(fp.save_name + ".txt","a") as f:
+                            f.write(msg+'\n')
+                else:
+                    skip = 0
+
+                if not test.pybullet:
+                    time.sleep(0.5)
+
+            # fingerprint
+            if save_fingerprint:
+                fingerprint_mu = []
+                fingerprint_var = []
+                fingerprint_x = []
+                if test.learn_force: 
+                    fingerprint_force = []
+
+            # main loop
+            done = False
+            iter_step = 0
+            save_rate = 1 + skip
+            stuck_count = 0
+            while not rospy.is_shutdown() and not done:
+                while iter_step < num_steps*save_rate:
+                    if test.got_state and test.got_img and not(test.pause):
+                        if use_vel and not fig1: # set up plotting
+                            plot_explr = Plotter(test.plot_idx,test.xinit,path=test.dir_path,plot_zs=False,render=fp.render_figs,robot_lim=test.robot_lim, tray_lim=test.tray_lim,save_folder='',tdist=True,states=test.states)
+                            fig1 = True
+                        if iter_step == 0 and tdist_mode in ['uniform','sphere']:
+                            plot_explr.update_samples(test.robot.lims[test.plot_idx])
+
+                        args = {'iter_step':iter_step} if use_vel else {'pos':new_traj[iter_step].copy()}
+                        success,out = test.step(**args)
+                        if success:
+                            x,y,force = out
+                            # verify x is different from last saved value before proceeding
+                            if iter_step == 0 or (np.linalg.norm(fingerprint_x[-1]-x) > 1e-3):
+                                stuck_count = 0
+                                if not fixed_seed:
+                                    y_pred,latent_space = fp.init_model(x,y,force)
+                                    seed = fp.reshape(y)
+                                    if save_fingerprint and iter_step % save_rate == 0 :
+                                        fingerprint_mu.append(latent_space[0])
+                                        fingerprint_var.append(latent_space[1])
+                                        fingerprint_x.append(x)
+                                        if test.learn_force: 
+                                            fingerprint_force.append(force)
+                                else:
+                                    y_pred = fp.get_prediction(x)
+                                # update_figs
+                                plot.update(seed.copy(),fp.reshape(y).copy(),fp.reshape(y_pred.squeeze()).copy(),latent_space)
+                                if save_fingerprint and iter_step % save_rate == 0 :
+                                    plot.set_fingerprint_label(f'Fingerprint {fp_id}')
+                                    if iter_step == 0 :
+                                        img_center = seed.copy()
+                                        plot.save(f'../center_{fingerprint_name}')
+                                    plot.save(f'{fingerprint_name}_eval{iter_step//save_rate}')
+                                if use_vel:
+                                    if test.explr_update is not None:
+                                        plot_explr.update(test.explr_update)
+                                        test.explr_update = None
+                                else:
+                                    print(iter_step,test_traj[iter_step])
+                                    # ax.plot(*test_traj[iter_step],'ro')
+                                iter_step += 1
+                            else:
+                                print(f'stuck at step {iter_step}')
+                                stuck_count += 1 
+                                if stuck_count > 1: 
+                                    test.fix_yaw()
+                    test.rate.sleep()
+
+                test.stop_pub.publish()
+                if save_fingerprint:
+                    fingerprint_dict = {
+                        "z_mu":np.array(fingerprint_mu),
+                        "z_var":np.array(fingerprint_var),
+                        "x":np.array(fingerprint_x),
+                        "center":np.array(robot_center),
+                        "center_img":np.array(img_center)
+                    }
+                    if test.learn_force: 
+                        fingerprint_dict["force"] = np.array(fingerprint_force)
+                    pickle.dump( fingerprint_dict, open( test.dir_path+f"{save_folder}/{fingerprint_name}_{test_method}.pickle", "wb" ) )
+                cprint(f'[TEST] finished {fingerprint_name} | {test.duration_str}','cyan')
+                done = True
+                if tdist_mode == 'uniform':
+                    pos = ws_conversion(x, test.robot_lim, test.tray_lim) # keep whatever angle the last fingperint ended on
+    cprint(f'[TEST] finished all fingerprints | {test.duration_str} ','cyan')
+    plot_explr.save(f'{save_folder}/fp_locs_final',full_path=False)
+    for tmp_plot in fp_figs:
+        plt.close(tmp_plot)
+    plot.close()

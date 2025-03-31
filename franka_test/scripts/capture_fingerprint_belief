@@ -1,0 +1,515 @@
+#!/usr/bin/env python
+
+########## global imports ##########
+import numpy as np
+import numpy.random as npr
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import seaborn as sns
+import pickle
+import math
+import random
+import yaml
+
+import datetime
+import time
+import copy
+
+import torch
+
+import rospy
+from scipy.cluster.vq import kmeans
+from argparse import Namespace
+from scipy.spatial.transform import Rotation
+from scipy.interpolate import interp1d
+from scipy.ndimage import maximum_filter,minimum_filter
+
+########## local imports ##########
+import sys, os
+from franka.franka_utils import ws_conversion
+from control.klerg_utils import *
+from dist_modules.sensor_test_module import SensorTest
+from dist_modules.fingerprint_module import process_grid_dist, rescale, FingerprintsPlotter
+from dist_modules.utils import set_seeds
+from plotting.plotting_matplotlib import set_mpl_format
+
+## change default figure params
+set_mpl_format()
+
+sns.set_palette('Paired')
+
+class FingerprintCapture(object):
+    def __init__(self,extra_method='mean'):
+        # params
+        model_path = rospy.get_param("model_path", "model_final.pth")
+        test_path = rospy.get_param('test_path', 'data/intensity/entklerg_0000/')
+        fingerprint_path = rospy.get_param("fingerprint_path", "eval/")
+        save_folder = rospy.get_param('save_folder', 'test/')
+        fingerprint_names = rospy.get_param('fingerprint_names', 'fp_id0 fp_id2 fp_id3')
+        self.fingerprint_names = fingerprint_names.split(' ')
+
+        # path to saved vars
+        base_path = rospy.get_param('base_path', './')
+        self.dir_path = base_path + '/' + test_path + '/'
+        self.fp_dir_path = self.dir_path+ '/' + fingerprint_path + '/' + save_folder + '/'
+
+        # load variables
+        with open(self.dir_path + "/config.yaml","r") as f:
+            params = yaml.load(f, Loader=yaml.FullLoader)
+        self.map_dict(params)
+
+        # seeds
+        set_seeds(self.seed)
+
+        ## Initialize VAE
+        loaded_info = torch.load(self.dir_path + model_path)
+        if not isinstance(loaded_info,dict):
+            ## raw model load
+            self.model = loaded_info.to('cpu')
+        else:
+            ## load state_dict only
+            from dist_modules.utils import build_arg_dicts
+            from vae import get_VAE
+            VAE = get_VAE(self.learn_force)
+            model_dict,_ = build_arg_dicts(self,None)
+            self.model = VAE(**model_dict).to('cpu')
+            self.model.load_state_dict(loaded_info,strict=False)
+        # print(self.model)
+        self.model.eval()
+        self.model.build_chunk_decoder()
+
+        self.reshape = lambda y: np.clip(y,0,1).T
+
+        # initalize buffers
+        self.tray_lim = np.array(self.tray_lim)
+        self.robot_lim = np.array(self.robot_lim)
+        self.tray_ctrl_lim = np.array(self.tray_ctrl_lim)
+        self.robot_ctrl_lim = np.array(self.robot_ctrl_lim)
+
+        self.load_fingerprints(extra_method)
+
+    def load_fingerprints(self,extra_method,cluster=False):
+        fp_base_name = rospy.get_param('fp_base_name', '_belief_[]_L2_LatentSpace_final.pickle')
+
+        # load the fingerprint info
+        self.center = {}
+        self.center_img = {}
+        fp_dicts = []
+        for name in self.fingerprint_names:
+            # get belief maps
+            fp_path = fp_base_name.replace('[]',name)
+            with open( self.fp_dir_path + fp_path,"rb") as f:
+                fp_dict = pickle.load(f)
+            fp = Namespace()
+            for k, v in fp_dict.items():
+                setattr(fp, k, v)
+            fp_dicts.append(fp)
+            self.center[name] = fp.center
+            self.center_img[name] = fp.center_img
+
+        num_samples = fp_dicts[0].num_samples[0]
+        lims = fp_dicts[0].lims
+        plot_idx = fp_dicts[0].plot_idx
+        extra_idx = fp_dicts[0].extra_idx
+        self.explr_idx = [*plot_idx,*extra_idx]
+        self.explr_states = ''.join([s for idx,s in enumerate(self.states) if idx in self.explr_idx])
+        self.robot_lim = self.robot_lim[self.explr_idx]
+        self.tray_lim = self.tray_lim[self.explr_idx]
+
+        self.extra = np.linspace(*lims[extra_idx],num_samples)
+        if 'w' in self.explr_states:
+            self.w_idx = self.states.rfind('w')
+            self.extra = ws_conversion(np.expand_dims(self.extra,-1),
+                                        self.robot_lim[extra_idx],self.tray_lim[extra_idx]).squeeze(-1)*180./np.pi # angles in degrees
+
+        # make the grids
+        xy_mesh = np.meshgrid(*np.linspace(*lims[plot_idx].T,num_samples).T)
+        xy_grid = np.c_[[m.ravel() for m in xy_mesh]].T
+
+        mesh = np.meshgrid(*np.linspace(*lims[self.explr_idx].T,num_samples).T)
+        grid = np.c_[[m.ravel() for m in mesh]].T
+
+        # test fingerprints
+        self.fp_image_locs = {}
+        self.fp_image_locs_flip = {}
+        self.fp_image_locs_extra_probs = {}
+        self.samples = {}
+        self.p_lists = {}
+        self.means = {}
+        p_list = np.array([fp.prior.reshape(fp.num_samples) for fp in fp_dicts])
+        p_list_processed = process_grid_dist(p_list.copy(),fp_dicts,extra_method)
+
+
+        # set up figure
+        fp_plotter = FingerprintsPlotter(self.fingerprint_names,None,lims[plot_idx])
+        fp_plotter.update(p_list = p_list_processed, samples = [xy_mesh]*len(fp_dicts))
+
+        for idx,(ax,target_dist,name,p,test_p) in enumerate(zip(fp_plotter.heatmap,fp_dicts,self.fingerprint_names,p_list,p_list_processed)):
+            # find max value
+            max_filter = np.argmax(p, axis=-1)
+
+            if cluster:
+                # kmeans clustering
+                # test_p = renormalize(test_p)
+                # test_p = np.log(test_p)
+                thresh = np.quantile(test_p,0.9)
+                p_objs = test_p > thresh
+                X = xy_grid[p_objs.flatten()]
+
+                means = []
+                distortions = []
+                bccm = []
+                # k = 0
+                # distortion = 1
+                # while distortion > 0.15:
+                #     k += 1
+                test_k = np.arange(1,10)
+                for k in test_k:
+                    cluster_means, distortion = kmeans(obs=X,k_or_guess=k)
+                    means.append(cluster_means)
+                    distortions.append(distortion)
+                    bcc = np.mean(np.linalg.norm(np.vstack([cluster_means-y for y in cluster_means]),axis=-1))
+                    bccm.append(bcc)
+
+                distortions = np.array(distortions)
+                bccm = np.array(bccm)
+                if np.all(bccm < 0.5):
+                    val = 0
+                else:
+                    val = np.argwhere(distortions < 0.15).flatten()[0]
+                cluster_means = means[val]
+            else:
+                # X = (minimum_filter(test_ps[1], size=25)==test_ps[1])
+                # max filter
+                X = (maximum_filter(test_p, size=10)==test_p)
+                # X[((test_p.max()-test_p)/(test_p.max()-test_p.min()))>.8] = False
+                cluster_means = xy_grid[X.flatten()]
+                within_bounds = np.prod(
+                    np.bitwise_and(cluster_means > self.robot_lim[0,0],
+                                    cluster_means < self.robot_lim[0,1]),
+                    axis=1,dtype=bool)
+                cluster_means = cluster_means[within_bounds]
+
+            # fig = plt.figure()
+            # plt.title(name)
+            # plt.plot(test_k,distortions,label='distortions')
+            # plt.plot(test_k,bccm,label='bccm')
+            # plt.vlines(test_k[val],np.amin([distortions,bccm]),np.amax([distortions,bccm]))
+            # plt.legend()
+
+            loc_3d = []
+            extra_probs = []
+            flip = []
+            for mean in cluster_means:
+                # from np.meshgrid info | In the 2-D case with inputs of length M and N, the outputs are of shape (N, M). In the 3-D case with inputs of length M, N and P, outputs are of shape (N, M, P)
+                xy_loc = np.argmin((np.linspace(*lims[:2].T,num_samples)-mean)**2,axis=0)
+                w_loc = max_filter[xy_loc[1],xy_loc[0]]
+                mesh_loc = (xy_loc[1],xy_loc[0],w_loc)
+                extra_des = mesh[2][mesh_loc]
+                if 'w' in self.explr_states:
+                    w_des = extra_des
+                    if (w_des < self.robot_lim[self.w_idx][0]) or (w_des > self.robot_lim[self.w_idx][1]):
+                        w_des = ws_conversion(np.array([w_des]), self.robot_lim[[self.w_idx]],self.tray_lim[[self.w_idx]]) # convert to angles
+                        w_des -= np.pi # flip
+                        w_des = (w_des + np.pi) % (2 * np.pi) - np.pi # wrap btwn -pi and pi
+                        w_des = ws_conversion(w_des, self.tray_lim[[self.w_idx]], self.robot_lim[[self.w_idx]]).squeeze() # convert back
+                        flip.append(1)
+                    else:
+                        flip.append(0)
+                else:
+                    flip.append(0)
+
+                loc_3d.append(np.array([mesh[0][mesh_loc],mesh[1][mesh_loc],extra_des]))
+                vals = p[xy_loc[1],xy_loc[0]]
+                vals = rescale(vals,[vals.min(),vals.max()],[0,1])
+                extra_probs.append(vals)
+            loc_3d = np.array(loc_3d)
+            flip = np.array(flip)
+            self.fp_image_locs[name] = loc_3d
+            self.fp_image_locs_flip[name] = flip
+            extra_probs = np.array(extra_probs)
+            self.fp_image_locs_extra_probs[name] = extra_probs
+            self.samples[name] = xy_mesh
+            self.p_lists[name] = test_p
+            self.means[name] = cluster_means
+
+            ## overlay test points
+            for idx,mean in enumerate(cluster_means):
+                ax.plot(*mean,'s',label=idx,zorder=5)
+
+        # add legend
+        for ax in fp_plotter.heatmap:
+            ax.legend(loc='upper center', bbox_to_anchor=(0.5, 0), ncol=5,columnspacing=0.1,handletextpad=0.1,fontsize='large')
+
+        self.fig = fp_plotter.fig
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+        plt.show(block=False)
+
+        print(self.fp_image_locs)
+
+    @torch.no_grad()
+    def init_model(self,seed_x,seed_y):
+        seed_x = torch.FloatTensor(seed_x).unsqueeze(axis=0)
+        seed_y = torch.FloatTensor(seed_y).unsqueeze(axis=0)
+        if self.learn_force:
+            seed_force = torch.FloatTensor(seed_force).unsqueeze(axis=0)
+            out = self.model(seed_x, seed_y, seed_force)
+        else:
+            out = self.model(seed_x, seed_y)
+        seed_img_pred, z_mu, z_logvar = out[0],out[2],out[3]
+        return seed_img_pred.detach().numpy().squeeze(), [z_mu.detach().numpy().squeeze(), z_logvar.exp().detach().numpy().squeeze()]
+
+    def map_dict(self, user_info):
+        for k, v in user_info.items():
+            setattr(self, k, v)
+
+class ExtraPlotter(object):
+    def __init__(self,extra,angle=True,render=True,path=None,sim=True,save_folder='eval/'):
+        self.render=render
+        if os.path.exists(path+save_folder) == False:
+            os.makedirs(path+save_folder)
+        self.path = path + save_folder
+        # set up plotting (fig 1)
+        titles = []
+        titles = titles + ['Stored']
+        titles = titles + ['Belief Grid']
+        titles = titles + ['Belief Angle']
+        titles = titles + ['Actual']
+        titles = titles + ['Imagined']
+        num_subplots = len(titles)
+        fig,axs = plt.subplots(1,num_subplots,figsize=(2.*(num_subplots),2.5))
+        self.fig = fig
+        self.ax = axs
+        for idx,(ax,title) in enumerate(zip(axs.flatten(),titles)):
+            ax.set_title(title)
+            if 'Belief' not in title:
+                ax.axes.xaxis.set_visible(False)
+                ax.axes.yaxis.set_visible(False)
+            elif 'Grid' in title:
+                ax.xaxis.set_ticks(np.linspace(-1,1,3))
+                ax.yaxis.set_ticks(np.linspace(-1,1,3))
+                # ax.set_xlabel("x")
+                # ax.set_ylabel("y")
+
+        self.set_fingerprint_label('Fingerprint TBD')
+
+        extra_ax = axs[2]
+        self.extra = extra
+        self.extra_vals = extra_ax.plot(extra,np.ones(len(extra)),".-k",lw=2)
+        self.current_loc = extra_ax.plot(extra[0],1.,"bs",ms=10,clip_on=False,zorder=2,label='actual')
+        if angle:
+            scale = 180
+        else:
+            scale = 1.
+        extra_ax.set_xlim(-1.05*scale,1.05*scale)
+        extra_ax.axes.xaxis.set_ticks(np.linspace(-1*scale,1*scale,5))
+        extra_ax.set_ylim(-0.05,1*1.05)
+        extra_ax.axes.yaxis.set_ticks(np.linspace(0,1,3))
+        extra_ax.tick_params(axis='both', labelsize='large')
+        extra_ax.set_xlabel('degrees',size='large')
+        # extra_ax.set_ylabel("\nlikelihood",size='large')
+        # extra_ax.legend(handletextpad=0.1,fontsize='large')
+        plt.tight_layout()
+
+        ## add colorbar / shift axes
+        self.cmap = 'gist_heat'
+        box = axs[1].get_position()
+        axColor = self.fig.add_axes([box.x0 + box.width*1.12, box.y0+0.15*box.height, 0.02, 0.7*box.height])
+        axColor.set_title('High',size='medium')
+        axColor.set_xlabel('Low')
+        sm = plt.cm.ScalarMappable(norm=mpl.colors.Normalize(vmin=0, vmax=1), cmap=self.cmap)
+        self.cbar = self.fig.colorbar(sm, cax = axColor, orientation="vertical")
+        self.cbar.set_ticks([])
+        self.cbar.set_ticklabels([])
+        box = axs[2].get_position()
+        axs[2].set_position([box.x0*1.05, box.y0, box.width, box.height])
+
+        # draw lines
+        for idx,scale in zip([0,2],[1.05,1.1]):
+            box0 = axs[idx].get_position()
+            x  = box0.x0+box0.width*scale
+            line = plt.Line2D([x,x],[0,1],transform=fig.transFigure, color="black")
+            fig.add_artist(line)
+
+        if self.render:
+            plt.ion()
+            plt.show(block=False)
+
+        self.stored = None
+        self.y = None
+        self.y_pred = None
+        self.tri = None
+        self.tri_loc = None
+
+    def set_fingerprint_label(self,name):
+        self.ax[0].axes.yaxis.set_visible(True)
+        self.ax[0].set_ylabel(name,size='large')
+        self.ax[0].yaxis.set_ticklabels([])
+        self.ax[0].yaxis.set_ticks([])
+        if self.render:
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
+
+
+    def build_heatmap(self,samples,p,mean,color="blue",use_grid=True):
+        ax = self.ax[1]
+        if self.tri is not None:
+            if hasattr(self.tri,'collections'):
+                # removes only the contours, leaves the rest intact
+                [c.remove() for c in self.tri.collections]
+        _min, _max = np.amin(p), np.amax(p)
+        plotting_args = {'cmap':self.cmap,'levels':30}
+        if use_grid:
+            self.tri = ax.contourf( *samples,p, **plotting_args)
+        else:
+            self.tri = ax.tricontourf( *samples.T, p, **plotting_args)
+        if self.tri_loc is None:
+            self.tri_loc =  ax.plot(*mean,"s",color=color,zorder=5,ms=10,label='actual')
+        else:
+            self.tri_loc[0].set_data(*mean)
+            self.tri_loc[0].set_color(color)
+        ax.legend(loc='upper center', bbox_to_anchor=(1.1, -0.1), handletextpad=0.1,fontsize='large')
+
+
+    def update(self,name,stored,y,y_pred,extra_vals,current_loc,samples,p,mean,color="blue"):
+        self.set_fingerprint_label(name)
+        if self.stored is None:
+            self.stored = self.ax[0].imshow(stored,cmap='gray')
+        else:
+            self.stored.set_data(stored)
+            self.stored.autoscale()
+
+
+        self.extra_vals[0].set_data(self.extra,extra_vals)
+        val = interp1d(self.extra,extra_vals)(current_loc)
+        self.current_loc[0].set_data(current_loc,val)
+        self.current_loc[0].set_color(color)
+        # self.ax[1].relim()
+        # self.ax[1].autoscale_view()
+
+        if p is not None:
+            self.build_heatmap(samples,p,mean,color)
+
+        if self.y is None:
+            self.y = self.ax[3].imshow(y,cmap='gray')
+        else:
+            self.y.set_data(y)
+            self.y.autoscale()
+
+        if self.y_pred is None:
+            self.y_pred = self.ax[4].imshow(y_pred,cmap='gray')
+        else:
+            self.y_pred.set_data(y_pred)
+            self.y_pred.autoscale()
+
+
+        if self.render:
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
+
+    def save(self,fname):
+        self.fig.savefig(self.path+fname+'.svg')
+
+    def close(self):
+        plt.close(self.fig)
+
+
+
+if __name__== '__main__':
+
+    extra_method = rospy.get_param("extra_method", "max")
+    type = rospy.get_param("type", "LatentSpace")
+    explr_states = rospy.get_param("explr_states", "xyzw")
+    fp_base_name = rospy.get_param('fp_base_name', '_belief_[]_L2_LatentSpace_final.pickle')
+    pybullet = rospy.get_param('pybullet',False)
+    step = fp_base_name.split('_')[-1]
+    step = step.split('.')[0]
+    save_folder = f'pictures_{extra_method}_{type}_{step}/'
+
+    fp = FingerprintCapture(extra_method=extra_method)
+    test = SensorTest(None,num_steps=None,init_vel=False)
+    plot = ExtraPlotter(extra=fp.extra,angle=('w'in fp.explr_states),path=fp.fp_dir_path,sim=test.pybullet,save_folder=save_folder)
+
+
+    def clip_pose(x,x_des):
+        if pybullet:
+            return x_des
+        # check angle
+        else:
+            x_check = x
+        # for idx in range(len(x_des)):
+        if 'w' in explr_states:
+            idx = explr_states.rfind('w')
+            if (x_des-x_check)[idx] > .5  :
+                x_des[idx] = x_check[idx] + 0.5
+            elif (x_des-x_check)[idx] < -.5  :
+                x_des[idx] = x_check[idx] - 0.5
+        return x_des
+
+
+    print(fp.fp_dir_path)
+
+    # main loop
+    x = test.xinit.copy()
+    done = False
+    fig1 = False
+    msgs = []
+    msg = "fp_id\tcount\ttray loc\trobot loc"
+    msgs.append(msg)
+    while not rospy.is_shutdown() and not done:
+        for name in fp.fingerprint_names:
+            test_locs = fp.fp_image_locs[name]
+            flip_locs = fp.fp_image_locs_flip[name]
+            center = fp.center[name]
+            center_img = fp.center_img[name]
+            fp_idx = name[-1]
+            samples = fp.samples[name]
+            p = fp.p_lists[name]
+            means = fp.means[name]
+            colors = sns.color_palette('Paired')
+            iter_step = 0
+            while iter_step < len(test_locs) and not rospy.is_shutdown():
+                if test.got_state and test.got_img and not(test.pause):
+                    x_des =test_locs[iter_step]
+                    flip = flip_locs[iter_step]
+                    tmp_x_des = clip_pose(x.copy(),x_des.copy())
+                    pos = ws_conversion(tmp_x_des,fp.robot_lim, fp.tray_lim)
+                    success, out = test.step(pos=pos)
+                    if success:
+                        x,y,force = out
+                        x_check = x[fp.explr_idx]
+                        # check if it's at the test location
+                        print(name, iter_step, x,x_check-x_des)
+                        if np.all(np.abs(x_check-x_des) < 0.01):
+                            # then plot
+                            y_pred,latent_space = fp.init_model(center,y,force)
+                            # fix angles and flip (if needed)
+                            if flip:
+                                y_pred = np.rot90(y_pred,axes=(1,2),k=2)
+                            if 'w' in fp.explr_states:
+                                image_angle = ws_conversion(x_des,fp.robot_lim, fp.tray_lim)[-1]
+                                image_angle += np.pi*flip
+                                image_angle = (image_angle + np.pi) % (2 * np.pi) - np.pi # wrap btwn -pi and pi
+                                image_angle = image_angle*180./np.pi # angle in degrees
+                                extra_loc = image_angle
+                            else:
+                                extra_loc = x_des[-1]
+                            # update_figs
+                            plot.update(f'Fingerprint {fp_idx}',center_img,
+                                        fp.reshape(y).copy(),fp.reshape(y_pred.squeeze()).copy(),
+                                        fp.fp_image_locs_extra_probs[name][iter_step],extra_loc,
+                                        samples,p,means[iter_step],colors[iter_step])
+                            plot.save(f'{name}_loc{iter_step}')
+                            msgs.append(f"{name}\t{iter_step}\t{x_des}\t{pos}")
+                            iter_step += 1
+                test.rate.sleep()
+
+        test.stop_pub.publish()
+        print('done')
+        done = True
+
+        fp.fig.savefig(fp.fp_dir_path + save_folder +'locs.svg')
+        with open(fp.fp_dir_path + save_folder + "log.txt","a") as f:
+            for msg in msgs:
+                f.write(msg+'\n')

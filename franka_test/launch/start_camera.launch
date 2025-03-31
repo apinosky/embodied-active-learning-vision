@@ -1,0 +1,28 @@
+<?xml version="1.0" ?>
+
+<launch>
+    <arg name="fps" default="60" />
+    <arg name="video_device" default="0" />
+    <arg name="cam_brightness" default="false" />
+    <arg name="room_brightness" default="false" />
+    <node name="usb_cam" pkg="usb_cam" type="usb_cam_node" output="screen" required="True">
+        <param name="video_device" value="/dev/video$(arg video_device)" />
+        <param name="image_width" value="640" />
+        <!-- <param name="image_height" value="480" /> -->
+        <param name="image_height" value="360" />
+        <param name="pixel_format" value="yuyv" />
+        <param name="camera_frame_id" value="usb_cam" />
+        <param name="io_method" value="mmap"/>
+        <param name="framerate" value="$(arg fps)"/>
+        <param name="camera_name" value="logitech_c270"/>
+        <!-- 4vl2-ctl params -->
+        <param name="auto_white_balance" value="true"/>
+        <param name="autoexposure" value="1"/>
+        <param name="exposure" value="166"/>
+        <param name="autofocus" value="false"/>
+    </node>
+
+    <node name="conditional_brightness" pkg="franka_test" type="conditional_brightness" output="screen" if="$(arg cam_brightness)"/>
+    <node name="lamp_brightness" pkg="franka_test" type="lamp_brightness" output="screen" if="$(arg room_brightness)"/>
+
+</launch>

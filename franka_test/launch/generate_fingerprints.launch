@@ -1,0 +1,75 @@
+<?xml version="1.0" ?>
+
+<launch>
+    <arg name="use_auto_recovery" default ="True" />
+    <arg name="use_gui" default ="False" />
+    <arg name="pybullet" default ="False" />
+    <arg name="render_pybullet" default ="True" />
+    <arg name="dt" default="0.1"/>
+    <arg name="cam_z" default="0.46" doc="currently only used for pybullet"/>
+    <arg name="sensor_method" default="rgb"/>
+
+    <arg name="test_method" default="explr" doc="circle grid or explr"/>
+    <arg name="save_fingerprint" default="True"/>
+    <arg name="test_path" default="data/rgb/entklerg_0001_ddp_2obj_z16_newlights_trainMulti" doc="path relative to franka_test directory"/>
+    <arg name="num_fingerprints" default="4" doc="number of clusters to find"/>
+    <arg name="model_path" default="model_final.pth" doc="name of model to test"/>
+    <arg name="buffer_name" default="explr_update_info.pickle" doc="name of buffer to load"/>
+    <arg name="explr_states" default="xy" doc="states to explore"/>
+    <arg name="save_folder" default="eval/" doc="where to save fingerprints"/>
+    <arg name="base_fp_name" default="fp" doc="how to name fingerprints"/>
+    <arg name="tdist_mode" default="sphere" doc="how to generate target distribution"/>
+
+    <arg name="circle_radius" default="0.05" doc="only if used test_method=circle"/>
+    <arg name="grid_size" default="0.1" doc="only if used test_method=grid"/>
+    <arg name="fixed_seed" default="False"/>
+    <arg name="skip" default="1"/>
+    <arg name="num_fp_samples" default="50"/>
+
+    <!-- params -->
+    <param name="base_path" value="$(find franka_test)" type="string" />
+    <param name="pybullet" value="$(arg pybullet)" type="bool" />
+    <param name="test_path" value="$(arg test_path)" type="string" />
+    <param name="dt" value="$(arg dt)" type="double" />
+    <param name="test_method" value="$(arg test_method)" type="string" />
+    <param name="circle_radius" value="$(arg circle_radius)" type="double" />
+    <param name="grid_size" value="$(arg grid_size)" type="double" />
+    <param name="fixed_seed" value="$(arg fixed_seed)" type="bool" />
+    <param name="save_fingerprint" value="$(arg save_fingerprint)" type="bool" />
+    <param name="num_fingerprints" value="$(arg num_fingerprints)" type="int" />
+    <param name="render_pybullet" value="$(arg render_pybullet)" type="bool" />
+    <param name="cam_z" value="$(arg cam_z)" type="double" />
+    <param name="model_path" value="$(arg model_path)" type="string" />
+    <param name="buffer_name" value="$(arg buffer_name)" type="string" />
+    <param name="explr_states" value="$(arg explr_states)" type="string" />
+    <param name="save_folder" value="$(arg save_folder)" type="string" />
+    <param name="base_fp_name" value="$(arg base_fp_name)" type="string" />
+    <param name="tdist_mode" value="$(arg tdist_mode)" type="string" />
+    <param name="skip" value="$(arg skip)" type="int" />
+    <param name="sensor_method" value="$(arg sensor_method)" type="string" />
+    <param name="num_steps" value="$(arg num_fp_samples)" type="int"/>
+
+    <!-- test nodes -->
+    <node name="build_fingerprints" pkg="franka_test" type="build_fingerprints" respawn="false" output="screen" required="true"/>
+
+    <!-- auto-recovery node -->
+    <group if="$(arg use_auto_recovery)">
+      <node name="random_listener" pkg="franka_test" type="random_listener" respawn="false" output="screen" required="false" unless="$(arg pybullet)">
+          <param name="fix_ee"   type="bool" value="False" />
+      </node>
+    </group>
+     
+    <!-- image nodes -->
+    <group if="$(eval (arg('sensor_method')=='rgb') or (arg('sensor_method')=='intensity'))">
+      <arg name="img_name" value="/usb_cam/image_raw" />
+
+      <node name="republish" type="republish" pkg="image_transport" output="screen" args="compressed in:=$(arg img_name) raw out:=/usb_cam/image" unless="$(arg pybullet)"/>
+
+      <!-- <node name="republish" type="republish" pkg="image_transport" output="screen" args="compressed in:=$(arg img_name) raw out:=/usb_cam/image_raw" if="$(arg pybullet)"/> -->
+    </group>
+
+    <!-- <node name="pybullet_service" pkg="franka_test" type="pybullet_service" respawn="false" output="log" if="$(arg pybullet)" /> -->
+
+    <node name="gui" pkg="franka_test" type="gui" respawn="false" output="screen" if="$(arg use_gui)" />
+
+</launch>

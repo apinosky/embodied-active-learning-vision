@@ -6,7 +6,7 @@ general:
   print_debug: False
   use_vel: True
   save_figs: True
-  render_figs: False
+  render_figs: True
   flat_sensor: False
 robot_control:
   # states: xyw # zw # yz #XYZ # XYZ #RPW # zw

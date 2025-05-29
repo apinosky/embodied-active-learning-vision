@@ -26,6 +26,7 @@ class FrankaEnv(object):
         self.render = render
         self.cam_sensors =  ['rgb','camera','cam','intensity']
         assert sensor_method in self.cam_sensors,f'invalid sensor requested'
+        self.use_camera = True
         self.img_shape = img_shape
         self.xlim = xlim
         self.ylim = ylim

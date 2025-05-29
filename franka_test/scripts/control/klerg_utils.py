@@ -61,47 +61,53 @@ def cost_norm(dist):
 
 ######### jit functions #########
 
-import numba as nb
-parallel = False
+try:
+    import numba as nb
+    parallel = False
+    @nb.jit(nopython=True,fastmath=True, cache=True, parallel=parallel)
+    def loopy_kldiv_grad_vec(x,samples,std,importance_ratio,outer_loops,dims,dtype):
+        grad = np.zeros((dims,outer_loops),dtype=dtype)
+        for outer_idx in nb.prange(outer_loops):
+            diff = (x-samples[outer_idx])
+            grad[:,outer_idx] = -(diff/std)
+            tmp = np.square(diff)/std
+            for dim_idx in range(1,dims):
+                tmp[0] += tmp[dim_idx]
+            grad[:,outer_idx] *= np.exp(-0.5 * tmp[0]) # psi
+        out = np.zeros(dims,dtype=dtype)
+        for idx in nb.prange(outer_loops):
+            out += grad[:,idx]*importance_ratio[idx]
+        return out  #/outer_loops
 
-@nb.jit(nopython=True,fastmath=True, cache=True, parallel=parallel)
-def loopy_kldiv_grad_vec(x,samples,std,importance_ratio,outer_loops,dims,dtype):
-    grad = np.zeros((dims,outer_loops),dtype=dtype)
-    for outer_idx in nb.prange(outer_loops):
-        diff = (x-samples[outer_idx])
-        grad[:,outer_idx] = -(diff/std)
-        tmp = np.square(diff)/std
-        for dim_idx in range(1,dims):
-            tmp[0] += tmp[dim_idx]
-        grad[:,outer_idx] *= np.exp(-0.5 * tmp[0]) # psi
-    out = np.zeros(dims,dtype=dtype)
-    for idx in nb.prange(outer_loops):
-        out += grad[:,idx]*importance_ratio[idx]
-    return out  #/outer_loops
+    def kldiv_grad_vec_numba(x,samples, explr_idx, std, importance_ratio, nu, dtype):
+        """ gradient of state footprint """
+        grad = np.zeros(x.shape[0],dtype=dtype)
+        x_tmp = x[explr_idx]
+        outer_loops,dims = samples.shape
+        grad[:dims] = loopy_kldiv_grad_vec(x_tmp,samples,std,importance_ratio,outer_loops,dims,dtype)
+        return grad # / nu
 
-def kldiv_grad_vec_numba(x,samples, explr_idx, std, importance_ratio, nu, dtype):
-    """ gradient of state footprint """
-    grad = np.zeros(x.shape[0],dtype=dtype)
-    x_tmp = x[explr_idx]
-    outer_loops,dims = samples.shape
-    grad[:dims] = loopy_kldiv_grad_vec(x_tmp,samples,std,importance_ratio,outer_loops,dims,dtype)
-    return grad # / nu
+    @nb.jit(nopython=True,fastmath=True, cache=True, parallel=parallel)
+    def loopy_traj_footprint_vec(traj,samples,std,outer_loops,inner_loops,dims,dtype):
+        pdf = np.zeros(outer_loops,dtype=dtype)
+        for outer_idx in nb.prange(outer_loops):
+            inner = np.square(traj-samples[outer_idx])/std
+            for inner_idx in nb.prange(inner_loops):
+                for dim_idx in nb.prange(1,dims):
+                    inner[inner_idx,0] += inner[inner_idx,dim_idx]
+                psi = np.exp(-0.5*inner[inner_idx,0])
+                pdf[outer_idx] += psi
+        return pdf # / inner_loops
 
-@nb.jit(nopython=True,fastmath=True, cache=True, parallel=parallel)
-def loopy_traj_footprint_vec(traj,samples,std,outer_loops,inner_loops,dims,dtype):
-    pdf = np.zeros(outer_loops,dtype=dtype)
-    for outer_idx in nb.prange(outer_loops):
-        inner = np.square(traj-samples[outer_idx])/std
-        for inner_idx in nb.prange(inner_loops):
-            for dim_idx in nb.prange(1,dims):
-                inner[inner_idx,0] += inner[inner_idx,dim_idx]
-            psi = np.exp(-0.5*inner[inner_idx,0])
-            pdf[outer_idx] += psi
-    return pdf # / inner_loops
-
-def traj_footprint_vec_numba(traj, samples, explr_idx, std, nu,dtype):
-    tmp_traj = traj[:,explr_idx]
-    abs_std = np.abs(std)
-    inner_loops = traj.shape[0]
-    outer_loops,dims = samples.shape
-    return loopy_traj_footprint_vec(tmp_traj,samples,abs_std,outer_loops,inner_loops,dims,dtype) / nu
+    def traj_footprint_vec_numba(traj, samples, explr_idx, std, nu,dtype):
+        tmp_traj = traj[:,explr_idx]
+        abs_std = np.abs(std)
+        inner_loops = traj.shape[0]
+        outer_loops,dims = samples.shape
+        return loopy_traj_footprint_vec(tmp_traj,samples,abs_std,outer_loops,inner_loops,dims,dtype) / nu
+    
+except: 
+    print("numba import error, not using numba. (you can manually disable numba by setting `set use_numba=False` in klerg.py")
+    kldiv_grad_vec_numba = kldiv_grad_vec
+    traj_footprint_vec_numba = traj_footprint_vec
+    

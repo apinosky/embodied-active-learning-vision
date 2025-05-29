@@ -4,12 +4,12 @@ cond=${1-none}
 
 ################ ROSLAUNCH params ################
 
-pybullet=False
-render_pybullet=False
+pybullet=True
+render_pybullet=True
 use_gui=True
 clustering=True
 starting_height=0.3
-test_config_file=test_config.yaml #  test_config_pybullet.yaml
+test_config_file=test_config_pybullet.yaml # test_config.yaml # 
 bias_fts=False # only applicable if you have an external force torque sensor
 
 if [ $cond != 'batch' ]

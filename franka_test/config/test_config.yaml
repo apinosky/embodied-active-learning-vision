@@ -1,6 +1,6 @@
 ---
 general:
-  num_steps: 200
+  num_steps: 1000
   save_rate: 200
   use_gpu: True
   print_debug: False

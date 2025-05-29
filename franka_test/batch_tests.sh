@@ -3,9 +3,9 @@
 source setup.bash 
 source test_env_vars.sh batch
 
-train=False
+train=True
 fp=False
-test=True
+test=False
 
 eval_mod=''
 

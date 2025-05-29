@@ -17,7 +17,7 @@ robot_control:
   traj_buffer_capacity: 3000
   buffer_capacity: 3000
   use_magnitude: False
-  R: 0.5 # [0.001,0.001,0.001,0.5,0.5,0.5] # 0.5 # [1.,1.,0.01]
+  R: 10.0 # 0.5 # [0.001,0.001,0.001,0.5,0.5,0.5] # 0.5 # [1.,1.,0.01]
 robot_workspace: 
   sensor_z_offset: 0.15875 # cm (2.5" f/t + 3.75" camera = 6.25")
   sensor_mass: 5.0 
@@ -29,7 +29,7 @@ robot_workspace:
     - [-0.15, 0.15] # z
     - [-0.5, 0.5] # r
     - [-0.5, 0.5] # p
-    - [-3., 3.] # w
+    - [-1.5, 1.5] # w
     - [-1.0, 1.0] # b 
   tray_lim:
     - [0.325, 0.625] # x
@@ -63,12 +63,12 @@ robot_workspace:
     - [-1.25, 1.25] # z
     - [-0.5, 0.5] # r
     - [-0.5, 0.5] # p
-    - [-1.25, 1.25] # w
+    - [-0.625, 0.625] # w
     - [-1.5, 1.5] # b  
 model:
   image_dim: [360,360,3] # rgb
-  down_sample: 1
-  zoom: 2
+  down_sample: 2
+  zoom: 1
   z_dim: 16
   y_logvar_dim: 1 # [3,3]
   hidden_dim: [512,256]
@@ -87,7 +87,7 @@ trainer:
   num_learning_opt: 25 # reduce if doing synchronous updates (e.g. 3)
   target_learning_rate: 3
   gamma_weight: 0.1 # set to 0 to disable gamma
-  target_samples_scale: 2 # 1 means use the same as above, 2 means use 2x above, etc.
+  target_samples_scale: 2 # 1 means use the same as above, 2 means use 2x above, etc. note: you might need to change this if you chage the zoom!
   hyperparam_ramp:
     fixed_beta: False
     fixed_gamma: False
